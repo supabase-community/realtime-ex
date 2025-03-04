@@ -27,6 +27,7 @@ defmodule Supabase.Realtime.MixProject do
 
   defp deps do
     [
+      {:gun, "~> 2.1"},
       {:supabase_potion, "~> 0.6"},
       {:ex_doc, ">= 0.0.0", only: [:dev], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
