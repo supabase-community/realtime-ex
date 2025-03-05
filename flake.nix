@@ -25,7 +25,7 @@
     in {
       default = mkShell {
         name = "realtime-ex";
-        packages = [elixir_1_18];
+        packages = [elixir_1_18 erlang_27];
       };
     });
   };

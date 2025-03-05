@@ -14,13 +14,17 @@ defmodule Supabase.Realtime.MixProject do
       docs: docs(),
       package: package(),
       description: description(),
+      elixirc_paths: elixirc_paths(Mix.env()),
       dialyzer: [plt_local_path: "priv/plts", ignore_warnings: ".dialyzerignore.exs"]
     ]
   end
 
+  defp elixirc_paths(e) when e in [:dev, :test], do: ["lib", "test/support.ex"]
+  defp elixirc_paths(_), do: ["lib"]
+
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, :wx, :observer, :runtime_tools],
       mod: {Supabase.Realtime.Application, []}
     ]
   end
