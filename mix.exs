@@ -23,10 +23,7 @@ defmodule Supabase.Realtime.MixProject do
   defp elixirc_paths(_), do: ["lib"]
 
   def application do
-    [
-      extra_applications: [:logger, :wx, :observer, :runtime_tools],
-      mod: {Supabase.Realtime.Application, []}
-    ]
+    [extra_applications: [:logger] ++ if(Mix.env() == :dev, do: [:wx, :observer], else: [])]
   end
 
   defp deps do

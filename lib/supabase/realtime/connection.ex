@@ -26,7 +26,8 @@ defmodule Supabase.Realtime.Connection do
           registry: atom(),
           socket: pid() | nil,
           status: Realtime.connection_state(),
-          ref: non_neg_integer(),
+          pending: map(),
+          stream_ref: reference() | nil,
           reconnect_timer: reference() | nil,
           heartbeat_timer: reference() | nil,
           heartbeat_interval: pos_integer(),
@@ -44,14 +45,15 @@ defmodule Supabase.Realtime.Connection do
 
   * `:name` - Optional registration name
   * `:registry` - Registry process name
-  * `:url` - WebSocket endpoint URL
-  * `:params` - Connection parameters
+  * `:client` - The `Supabase.Client` self-managed client name
   * `:heartbeat_interval` - Interval in milliseconds between heartbeats
   * `:reconnect_after_ms` - Function that returns reconnection delay based on attempts
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
     name = opts[:name] || __MODULE__
+    _ = Keyword.fetch!(opts, :registry)
+    _ = Keyword.fetch!(opts, :client)
 
     GenServer.start_link(__MODULE__, opts, name: name)
   end
@@ -64,11 +66,10 @@ defmodule Supabase.Realtime.Connection do
   * `server` - The server PID or name
   * `channel` - The channel struct
   * `payload` - The message payload
-  * `opts` - Send options
   """
-  @spec send_message(GenServer.server(), Channel.t(), map(), keyword()) :: :ok | {:error, term()}
-  def send_message(server, %Channel{} = channel, payload, opts \\ []) do
-    GenServer.call(server, {:send_message, channel, payload, opts})
+  @spec send_message(GenServer.server(), Channel.t(), map()) :: :ok | {:error, term()}
+  def send_message(server, %Channel{} = channel, payload) do
+    GenServer.call(server, {:send_message, channel, payload})
   end
 
   @doc """
@@ -79,27 +80,24 @@ defmodule Supabase.Realtime.Connection do
   * `server` - The server PID or name
   """
   @spec state(GenServer.server()) :: Realtime.connection_state()
-  def state(server) do
-    GenServer.call(server, :state)
-  end
+  def state(server), do: GenServer.call(server, :state)
 
   # Server callbacks
 
   @impl true
   def init(opts) do
+    client = opts[:client]
     registry = opts[:registry]
-    url = opts[:url]
-    params = opts[:params] || %{}
     heartbeat_interval = opts[:heartbeat_interval] || :timer.seconds(30)
     reconnect_function = opts[:reconnect_after_ms] || (&default_reconnect_after_ms/1)
 
     state = %{
-      url: url,
-      params: params,
+      client: client,
       registry: registry,
       socket: nil,
       status: :closed,
-      ref: 0,
+      stream_ref: nil,
+      pending: %{},
       reconnect_timer: nil,
       heartbeat_timer: nil,
       heartbeat_interval: heartbeat_interval,
@@ -108,155 +106,150 @@ defmodule Supabase.Realtime.Connection do
       reconnect_after_ms: reconnect_function
     }
 
-    # Schedule immediate connection
     {:ok, state, {:continue, :connect}}
   end
 
   @impl true
   def handle_continue(:connect, state) do
-    # Start connection process
     case connect(state) do
       {:ok, socket, updated_state} ->
-        # Schedule the first heartbeat
         heartbeat_timer = schedule_heartbeat(state.heartbeat_interval)
 
         {:noreply, %{updated_state | socket: socket, heartbeat_timer: heartbeat_timer}}
 
       {:error, reason, updated_state} ->
-        # Schedule reconnection
+        Logger.error("[#{__MODULE__}]: Failed to connect: #{inspect(reason)}")
         reconnect_timer = schedule_reconnect(updated_state)
 
         {:noreply, %{updated_state | reconnect_timer: reconnect_timer}}
     end
   end
 
-  @impl true
-  def handle_call(:state, _from, state) do
-    {:reply, state.status, state}
+  def handle_continue(:upgrade, %{socket: socket} = state) do
+    {:ok, client} = state.client.get_client()
+    uri = build_url(client)
+    path = uri.path <> if(uri.query, do: "?" <> uri.query, else: "")
+
+    headers = [
+      {~c"user-agent", ~c"SupabasePotion/#{version()}"},
+      {~c"x-client-info", ~c"supabase-realtime-elixir/#{version()}"},
+      # {"apikey", client.apikey},
+      {~c"authorization", ~c"Bearer #{client.access_token || client.apikey}"}
+    ]
+
+    stream_ref = :gun.ws_upgrade(socket, path, headers)
+
+    {:noreply, %{state | stream_ref: stream_ref}}
   end
 
   @impl true
-  def handle_call({:send_message, channel, payload, opts}, _from, state) do
-    result =
-      if state.status == :open and state.socket do
-        # Prepare the message
-        ref = make_ref(state)
+  def handle_call(:state, _from, state), do: {:reply, state.status, state}
 
-        message = %{
-          topic: channel.topic,
-          event: payload[:event] || "phx_message",
-          payload: payload[:payload] || %{},
-          ref: ref
-        }
+  def handle_call({:send_message, channel, _}, _from, %{status: status, socket: nil} = state)
+      when status != :open do
+    Logger.warning(
+      "[#{inspect(__MODULE__)}]: Not connected, ignoring message for channel: #{inspect(channel)}"
+    )
 
-        # Serialize and send the message
-        encoded = Message.encode(message)
+    {:reply, {:error, :not_connected}, state}
+  end
 
-        case :gun.ws_send(state.socket, {:text, encoded}) do
-          :ok ->
-            {:ok, ref}
+  def handle_call({:send_message, channel, payload}, _from, state) do
+    {:ok, message_ref} = send_message_to_topic(channel.topic, payload, state)
 
-          error ->
-            {:error, error}
-        end
-      else
-        {:error, :not_connected}
-      end
-
-    {:reply, result, %{state | ref: state.ref + 1}}
+    {:reply, :ok, %{state | pending: Map.put(state.pending, message_ref, channel)}}
   end
 
   @impl true
   def handle_info({:gun_up, socket, _protocol}, %{socket: socket} = state) do
-    Logger.debug("Supabase.Realtime.Connection: Connection established")
-
-    # Update connection status
-    updated_state = %{state | status: :open, reconnect_attempts: 0}
-
-    # Schedule heartbeat
+    Logger.debug("[#{__MODULE__}]: Connection established")
+    updated_state = %{state | reconnect_attempts: 0}
     heartbeat_timer = schedule_heartbeat(state.heartbeat_interval)
 
-    {:noreply, %{updated_state | heartbeat_timer: heartbeat_timer}}
+    {:noreply, %{updated_state | heartbeat_timer: heartbeat_timer}, {:continue, :upgrade}}
   end
 
-  @impl true
+  def handle_info({:gun_response, socket, _, _, status, headers}, %{socket: socket} = state) do
+    Logger.debug("[#{__MODULE__}]: Failed to upgrade to websocket: #{inspect(status)}")
+    # maybe try to upgrade again? stop? i dunno
+    {:stop, {:error, {:failed_to_upgrade, status, headers}}, %{state | status: :closed}}
+  end
+
+  def handle_info(
+        {:gun_error, socket, stream, reason},
+        %{socket: socket, stream_ref: stream} = state
+      ) do
+    Logger.error("[#{__MODULE__}]: Connection error: #{inspect(reason)}")
+    {:stop, {:error, reason}, %{state | status: :closed}}
+  end
+
+  def handle_info(
+        {:gun_upgrade, socket, stream, ["websocket"], _headers},
+        %{socket: socket, stream_ref: stream} = state
+      ) do
+    Logger.debug("[#{__MODULE__}]: Connection upgraded to websocket with success")
+    {:noreply, %{state | status: :open}}
+  end
+
   def handle_info(
         {:gun_down, socket, _protocol, reason, _killed_streams},
         %{socket: socket} = state
       ) do
-    Logger.debug("Supabase.Realtime.Connection: Connection down: #{inspect(reason)}")
-
-    # Update connection status
+    Logger.debug("[#{__MODULE__}]: Connection down: #{inspect(reason)}")
     updated_state = %{state | status: :closed}
 
-    # Cancel heartbeat timer
     if state.heartbeat_timer do
       Process.cancel_timer(state.heartbeat_timer)
     end
 
-    # Schedule reconnection
     reconnect_timer = schedule_reconnect(updated_state)
 
     {:noreply, %{updated_state | heartbeat_timer: nil, reconnect_timer: reconnect_timer}}
   end
 
-  @impl true
-  def handle_info({:gun_ws, socket, _stream, {:text, data}}, %{socket: socket} = state) do
-    # Decode the message
+  def handle_info(
+        {:gun_ws, socket, stream, {:text, data}},
+        %{socket: socket, stream_ref: stream} = state
+      ) do
     case Message.decode(data) do
       {:ok, message} ->
-        # Handle the message
         handle_ws_message(message, state)
 
       {:error, reason} ->
-        Logger.error("Supabase.Realtime.Connection: Failed to decode message: #{inspect(reason)}")
+        Logger.error("[#{__MODULE__}]: Failed to decode message: #{inspect(reason)}")
         {:noreply, state}
     end
   end
 
-  @impl true
+  def handle_info(:heartbeat, %{socket: nil, status: status} = state) when status != :open do
+    {:noreply, state}
+  end
+
   def handle_info(:heartbeat, state) do
-    # Send heartbeat if connected
-    updated_state =
-      if state.status == :open and state.socket do
-        # Send heartbeat message
-        ref = make_ref(state)
+    heartbeat_ref = generate_join_ref()
 
-        heartbeat_message = %{
-          topic: "phoenix",
-          event: "heartbeat",
-          payload: %{},
-          ref: ref
-        }
+    message = %{
+      event: "heartbeat",
+      payload: %{},
+      ref: heartbeat_ref
+    }
 
-        encoded = Message.encode(heartbeat_message)
-        :gun.ws_send(state.socket, {:text, encoded})
-
-        # Update state with pending heartbeat ref
-        %{state | ref: state.ref + 1, pending_heartbeat_ref: ref}
-      else
-        state
-      end
-
-    # Schedule next heartbeat
+    send_message_to_topic("phoenix", message, state)
     heartbeat_timer = schedule_heartbeat(state.heartbeat_interval)
 
-    {:noreply, %{updated_state | heartbeat_timer: heartbeat_timer}}
+    {:noreply, %{state | heartbeat_timer: heartbeat_timer, pending_heartbeat_ref: heartbeat_ref}}
   end
 
   @impl true
   def handle_info(:reconnect, state) do
-    # Attempt to reconnect
     case connect(%{state | reconnect_attempts: state.reconnect_attempts + 1}) do
       {:ok, socket, updated_state} ->
-        # Connection successful
         heartbeat_timer = schedule_heartbeat(state.heartbeat_interval)
 
         {:noreply,
          %{updated_state | socket: socket, heartbeat_timer: heartbeat_timer, reconnect_timer: nil}}
 
       {:error, _reason, updated_state} ->
-        # Schedule another reconnection attempt
         reconnect_timer = schedule_reconnect(updated_state)
 
         {:noreply, %{updated_state | reconnect_timer: reconnect_timer}}
@@ -265,123 +258,119 @@ defmodule Supabase.Realtime.Connection do
 
   @impl true
   def terminate(_reason, state) do
-    # Close WebSocket connection if open
-    if state.status == :open and state.socket do
+    if state.status == :open and !!state.socket do
       :gun.close(state.socket)
     end
 
-    # Cancel timers
-    if state.heartbeat_timer do
-      Process.cancel_timer(state.heartbeat_timer)
-    end
-
-    if state.reconnect_timer do
-      Process.cancel_timer(state.reconnect_timer)
-    end
+    if state.heartbeat_timer, do: Process.cancel_timer(state.heartbeat_timer)
+    if state.reconnect_timer, do: Process.cancel_timer(state.reconnect_timer)
 
     :ok
   end
 
   # Private helper functions
 
-  # Establish WebSocket connection
   defp connect(state) do
-    # Build the URL with parameters
-    url = build_url(state.url, state.params)
+    {:ok, client} = state.client.get_client()
+    uri = build_url(client)
 
-    # Parse the URL
-    uri = URI.parse(url)
-
-    # Get the host and port
     host = String.to_charlist(uri.host)
     port = uri.port || if uri.scheme == "wss", do: 443, else: 80
 
-    # Start gun
     gun_opts = %{
       protocols: [:http],
+      http_opts: %{version: :"HTTP/1.1"},
       transport: if(uri.scheme == "wss", do: :tls, else: :tcp),
-      transport_opts: [
+      tls_opts: [
         verify: :verify_none
       ]
     }
 
     case :gun.open(host, port, gun_opts) do
-      {:ok, conn_pid} ->
-        # Wait for gun to connect
-        case :gun.await_up(conn_pid, 5000) do
-          {:ok, _protocol} ->
-            # Upgrade to WebSocket
-            ws_opts = %{protocols: [{:http, :websocket}]}
-            path = uri.path <> if(uri.query, do: "?" <> uri.query, else: "")
+      {:ok, socket} ->
+        # {:ok, _protocol} <- :gun.await_up(conn_pid, :timer.seconds(5)) do
+        Process.monitor(socket)
 
-            :gun.ws_upgrade(conn_pid, path, [], ws_opts)
-
-            # Return success
-            {:ok, conn_pid, %{state | status: :connecting}}
-
-          {:error, reason} ->
-            Logger.error("Supabase.Realtime.Connection: Failed to connect: #{inspect(reason)}")
-            {:error, reason, %{state | status: :closed}}
-        end
+        {:ok, socket, %{state | status: :connecting}}
 
       {:error, reason} ->
-        Logger.error(
-          "Supabase.Realtime.Connection: Failed to open connection: #{inspect(reason)}"
-        )
-
+        Logger.error("[#{__MODULE__}]: Failed to connect: #{inspect(reason)}")
         {:error, reason, %{state | status: :closed}}
     end
   end
 
-  # Build the WebSocket URL with parameters
-  defp build_url(base_url, params) do
-    query = URI.encode_query(Map.put(params, :vsn, "1.0.0"))
-    base_url <> "?" <> query
+  defp build_url(%Supabase.Client{} = client) do
+    query = URI.encode_query(%{apikey: client.api_key, vsn: "1.0.0"})
+
+    URI.new!(client.realtime_url)
+    |> URI.append_path("/websocket")
+    |> URI.append_query(query)
+    |> then(&update_uri_scheme/1)
   end
 
-  # Generate a new message reference
-  defp make_ref(state) do
-    "#{state.ref + 1}"
-  end
+  defp update_uri_scheme(%URI{scheme: "http"} = uri), do: %{uri | scheme: "ws"}
+  defp update_uri_scheme(%URI{scheme: "https"} = uri), do: %{uri | scheme: "wss"}
+  defp update_uri_scheme(uri), do: uri
 
-  # Schedule heartbeat
   defp schedule_heartbeat(interval) do
     Process.send_after(self(), :heartbeat, interval)
   end
 
-  # Schedule reconnection with exponential backoff
   defp schedule_reconnect(state) do
     reconnect_time = state.reconnect_after_ms.(state.reconnect_attempts)
     Process.send_after(self(), :reconnect, reconnect_time)
   end
 
-  # Default reconnection backoff function
+  @max_backoff :timer.seconds(10)
+  @base_backoff :timer.seconds(1)
+
   defp default_reconnect_after_ms(tries) do
-    [1_000, 2_000, 5_000, 10_000]
-    |> Enum.at(tries - 1, 10_000)
+    min(@max_backoff, (@base_backoff * 2) ** tries)
   end
 
-  # Handle WebSocket messages
+  defp handle_ws_message(
+         %{"topic" => "phoenix", "event" => "phx_reply", "ref" => ref},
+         %{pending_heartbeat_ref: ref} = state
+       ) do
+    Logger.debug("[#{__MODULE__}]: Received heartbeat reply")
+    {:noreply, %{state | pending_heartbeat_ref: nil}}
+  end
+
   defp handle_ws_message(message, state) do
-    # Check if this is a heartbeat response
-    is_heartbeat_reply =
-      message["topic"] == "phoenix" and
-        message["event"] == "phx_reply" and
-        message["ref"] == state.pending_heartbeat_ref
+    Logger.debug("[#{__MODULE__}]: Received message: #{inspect(message)}")
 
-    updated_state =
-      if is_heartbeat_reply do
-        # Clear pending heartbeat ref
-        %{state | pending_heartbeat_ref: nil}
-      else
-        # Forward message to registry
-        if state.registry do
-          Channel.Registry.handle_message(state.registry, message)
-        end
+    if state.registry do
+      Channel.Registry.handle_message(state.registry, message)
+    else
+      Logger.error("[#{__MODULE__}]: No registry found")
+    end
 
-        state
-      end
+    {:noreply, state}
+  end
 
-    {:noreply, updated_state}
+  defp version do
+    if version = Application.spec(:supabase_potion)[:vsn] do
+      List.to_string(version)
+    end
+  end
+
+  defp generate_join_ref do
+    "msg:" <> (:crypto.strong_rand_bytes(10) |> Base.encode16(case: :lower))
+  end
+
+  defp send_message_to_topic(topic, payload, state) do
+    message_ref = payload[:ref] || generate_join_ref()
+
+    message = %{
+      topic: topic,
+      event: payload[:event] || "phx_message",
+      payload: payload[:payload] || %{},
+      ref: message_ref
+    }
+
+    {:ok, encoded} = Message.encode(message)
+    :ok = :gun.ws_send(state.socket, state.stream_ref, {:text, encoded})
+
+    {:ok, message_ref}
   end
 end

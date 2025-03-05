@@ -156,20 +156,19 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   @impl true
-  def handle_call({:create_channel, topic, opts}, {client_pid, _ref}, state) do
+  def handle_call({:create_channel, topic, opts}, _from, state) do
     topic = normalize_topic(topic)
 
     if channel = find_channel_by_topic(state.channels, topic) do
       {:reply, {:ok, channel}, state}
     else
-      channel = Channel.new(topic, client_pid, opts)
+      channel = Channel.new(topic, self(), opts)
       updated_channels = Map.put(state.channels, channel.ref, channel)
 
       {:reply, {:ok, channel}, %{state | channels: updated_channels}}
     end
   end
 
-  @impl true
   def handle_call({:subscribe, channel, type, filter}, _from, state) do
     if channel = Map.get(state.channels, channel.ref) do
       updated_channel = Channel.add_binding(channel, type, filter)
@@ -181,7 +180,6 @@ defmodule Supabase.Realtime.Channel.Registry do
     end
   end
 
-  @impl true
   def handle_call({:unsubscribe, channel}, _from, state) do
     if channel = Map.get(state.channels, channel.ref) do
       updated_channel = Channel.update_state(channel, :leaving)
@@ -193,7 +191,6 @@ defmodule Supabase.Realtime.Channel.Registry do
     end
   end
 
-  @impl true
   def handle_call(:remove_all_channels, _from, state) do
     updated_channels =
       Map.new(state.channels, fn {ref, channel} ->
@@ -204,19 +201,16 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   @impl true
-  def handle_cast({:handle_message, %{topic: topic, payload: payload, event: event}}, state) do
-    matching_channels =
-      state.channels
-      |> Map.values()
-      |> Enum.filter(fn channel -> channel.topic == topic end)
+  def handle_cast({:handle_message, %{"event" => event, "topic" => topic} = msg}, state) do
+    %{"payload" => payload} = msg
+    matching_channels = filter_channels_by_topic(state.channels, topic)
 
     case event do
-      "phx_reply" -> handle_reply(matching_channels, payload, state)
+      "phx_reply" -> handle_reply(matching_channels, msg, state)
       _ -> handle_event(matching_channels, event, payload, state)
     end
   end
 
-  @impl true
   def handle_cast({:update_join_ref, channel, join_ref}, state) do
     if channel = Map.get(state.channels, channel.ref) do
       updated_channel = Channel.set_join_ref(channel, join_ref)
@@ -228,7 +222,6 @@ defmodule Supabase.Realtime.Channel.Registry do
     end
   end
 
-  @impl true
   def handle_cast({:update_channel_state, channel, new_state}, state) do
     if channel = Map.get(state.channels, channel.ref) do
       updated_channel = Channel.update_state(channel, new_state)
@@ -250,33 +243,43 @@ defmodule Supabase.Realtime.Channel.Registry do
     end
   end
 
+  defp filter_channels_by_topic(channels, topic) do
+    channels
+    |> Map.values()
+    |> Enum.filter(&(&1.topic == topic))
+  end
+
   defp find_channel_by_topic(channels, topic) do
     channels
     |> Map.values()
     |> Enum.find(fn channel -> channel.topic == topic end)
   end
 
-  defp handle_reply(channels, %{"status" => status}, state) do
-    updated_channels =
-      Enum.reduce(channels, state.channels, &update_channel_state_from_reply(&1, status, &2))
+  defp handle_reply(channels, %{"ref" => join_ref} = msg, state) do
+    %{"payload" => %{"status" => status}} = msg
 
-    {:noreply, %{state | channels: updated_channels}}
-  end
+    Enum.reduce(channels, state.channels, fn matched, acc ->
+      case status do
+        "ok" when matched.state == :joining ->
+          Logger.debug("[#{matched.topic}] Successfully joined channel #{matched.ref}")
 
-  defp update_channel_state_from_reply(channel, "ok", acc) do
-    channel
-    |> Channel.update_state(:joined)
-    |> then(&Map.put(acc, channel.ref, &1))
-  end
+          matched
+          |> Channel.update_state(:joined)
+          |> Channel.set_join_ref(join_ref)
 
-  defp update_channel_state_from_reply(channel, status, acc) when status in ~w(error timeout) do
-    channel
-    |> Channel.update_state(:errored)
-    |> then(&Map.put(acc, channel.ref, &1))
-  end
+        "ok" ->
+          Channel.update_state(matched, :errored)
 
-  defp update_channel_state_from_reply(channel, _, acc) do
-    Map.put(acc, channel.ref, channel)
+        s when s in ~w(error timeout) ->
+          Logger.error("[#{matched.topic}] Failed to join channel #{matched.ref}: #{s}")
+          Channel.update_state(matched, :errored)
+
+        _ ->
+          matched
+      end
+      |> then(&Map.put(acc, matched.ref, &1))
+    end)
+    |> then(&{:noreply, %{state | channels: &1}})
   end
 
   defp handle_event(channels, event, payload, state) when is_database_event(event) do
@@ -284,7 +287,7 @@ defmodule Supabase.Realtime.Channel.Registry do
 
     if channels != [] and function_exported?(state.module, :handle_event, 1) do
       Task.start(fn ->
-        # enforce event delivery
+        # enforce event delivery/processing
         :ok = state.module.handle_event({:postgres_changes, db_event_type, payload})
       end)
     else

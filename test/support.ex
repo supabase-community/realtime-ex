@@ -20,3 +20,23 @@ defmodule Support.Realtime do
     Logger.debug("received event: #{inspect(event)}")
   end
 end
+
+defmodule Support.Supervisor do
+  @moduledoc false
+
+  use Supervisor
+
+  def start_link(_ \\ []) do
+    Supervisor.start_link(__MODULE__, :ok, name: Supabase.Realtime.Supervisor)
+  end
+
+  @impl true
+  def init(:ok) do
+    children = [
+      Support.Client,
+      {Support.Realtime, supabase_client: Supabase.Client}
+    ]
+
+    Supervisor.init(children, strategy: :one_for_one)
+  end
+end
