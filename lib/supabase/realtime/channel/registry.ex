@@ -11,6 +11,7 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   alias Supabase.Realtime
   alias Supabase.Realtime.Channel
+  alias Supabase.Realtime.Message
 
   require Logger
 
@@ -164,8 +165,9 @@ defmodule Supabase.Realtime.Channel.Registry do
     else
       channel = Channel.new(topic, self(), opts)
       updated_channels = Map.put(state.channels, channel.ref, channel)
+      state = %{state | channels: updated_channels}
 
-      {:reply, {:ok, channel}, %{state | channels: updated_channels}}
+      {:reply, {:ok, channel}, state}
     end
   end
 
@@ -173,8 +175,9 @@ defmodule Supabase.Realtime.Channel.Registry do
     if channel = Map.get(state.channels, channel.ref) do
       updated_channel = Channel.add_binding(channel, type, filter)
       updated_channels = Map.put(state.channels, channel.ref, updated_channel)
+      state = %{state | channels: updated_channels}
 
-      {:reply, :ok, %{state | channels: updated_channels}}
+      {:reply, :ok, state, {:continue, {:join, channel}}}
     else
       {:reply, {:error, :channel_not_found}, state}
     end
@@ -184,8 +187,9 @@ defmodule Supabase.Realtime.Channel.Registry do
     if channel = Map.get(state.channels, channel.ref) do
       updated_channel = Channel.update_state(channel, :leaving)
       updated_channels = Map.put(state.channels, channel.ref, updated_channel)
+      state = %{state | channels: updated_channels}
 
-      {:reply, :ok, %{state | channels: updated_channels}}
+      {:reply, :ok, state, {:continue, {:leave, channel}}}
     else
       {:reply, {:error, :channel_not_found}, state}
     end
@@ -197,7 +201,11 @@ defmodule Supabase.Realtime.Channel.Registry do
         {ref, Channel.update_state(channel, :leaving)}
       end)
 
-    {:reply, :ok, %{state | channels: updated_channels}}
+    state = %{state | channels: updated_channels}
+
+    for {_, channel} <- state.channels, do: unsubscribe(self(), channel)
+
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -231,6 +239,19 @@ defmodule Supabase.Realtime.Channel.Registry do
     else
       {:noreply, state}
     end
+  end
+
+  @impl true
+  def handle_continue({:join, channel}, state) do
+    state.module.send(channel, Message.subscription_message(channel))
+
+    {:noreply, state}
+  end
+
+  def handle_continue({:leave, channel}, state) do
+    state.module.send(channel, Message.unsubscribe_message(channel))
+
+    {:noreply, state}
   end
 
   # Private helper functions

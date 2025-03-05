@@ -47,7 +47,6 @@ defmodule Supabase.Realtime do
 
   alias Supabase.Realtime
   alias Supabase.Realtime.Channel
-  alias Supabase.Realtime.Message
 
   @typedoc """
   Connection states for the WebSocket client.
@@ -257,23 +256,16 @@ defmodule Supabase.Realtime do
       @doc """
       Check `Supabase.Realtime.on/3` for more information.
       """
-      def on(channel, type, filter) do
-        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__),
-             :ok <- Realtime.on(channel, type, filter) do
-          if Channel.closed?(channel) do
-            msg = Message.subscription_message(channel, %{type => [Map.new(filter)]})
-            Realtime.Connection.send_message(conn, channel, msg)
-            Channel.Registry.update_channel_state(channel.registry, channel, :joining)
-          end
-
-          :ok
-        end
-      end
+      defdelegate on(channel, type, filter), to: Realtime
 
       @doc """
       Check `Supabase.Realtime.send/2` for more information.
       """
-      defdelegate send(channel, payload), to: Realtime
+      def send(channel, payload) do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.send(conn, channel, payload)
+        end
+      end
 
       @doc """
       Check `Supabase.Realtime.unsubscribe/1` for more information.
@@ -346,6 +338,7 @@ defmodule Supabase.Realtime do
 
   ## Parameters
 
+  * `conn` - The connection PID or name
   * `channel` - The channel struct
   * `payload` - The message payload
   * `opts` - Send options (e.g., timeout)
@@ -354,9 +347,9 @@ defmodule Supabase.Realtime do
 
       Realtime.send(channel, type: "broadcast", event: "new_message", payload: %{body: "Hello"})
   """
-  @spec send(channel(), map()) :: :ok | {:error, term()}
-  def send(%Channel{} = channel, payload) when is_map(payload) do
-    with pid when is_pid(pid) <- ensure_pid(channel.registry) do
+  @spec send(pid | module, channel(), map()) :: :ok | {:error, term()}
+  def send(conn, %Channel{} = channel, payload) when is_map(payload) do
+    with pid when is_pid(pid) <- ensure_pid(conn) do
       Realtime.Connection.send_message(pid, channel, payload)
     end
   end

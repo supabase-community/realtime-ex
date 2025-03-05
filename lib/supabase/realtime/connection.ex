@@ -128,12 +128,11 @@ defmodule Supabase.Realtime.Connection do
   def handle_continue(:upgrade, %{socket: socket} = state) do
     {:ok, client} = state.client.get_client()
     uri = build_url(client)
-    path = uri.path <> if(uri.query, do: "?" <> uri.query, else: "")
+    path = uri.path <> if(uri.query != "", do: "?" <> uri.query, else: "")
 
     headers = [
       {~c"user-agent", ~c"SupabasePotion/#{version()}"},
       {~c"x-client-info", ~c"supabase-realtime-elixir/#{version()}"},
-      # {"apikey", client.apikey},
       {~c"authorization", ~c"Bearer #{client.access_token || client.apikey}"}
     ]
 
@@ -228,13 +227,8 @@ defmodule Supabase.Realtime.Connection do
   def handle_info(:heartbeat, state) do
     heartbeat_ref = generate_join_ref()
 
-    message = %{
-      event: "heartbeat",
-      payload: %{},
-      ref: heartbeat_ref
-    }
-
-    send_message_to_topic("phoenix", message, state)
+    message = Message.heartbeat_message()
+    send_message_to_topic("phoenix", Map.put(message, :ref, heartbeat_ref), state)
     heartbeat_timer = schedule_heartbeat(state.heartbeat_interval)
 
     {:noreply, %{state | heartbeat_timer: heartbeat_timer, pending_heartbeat_ref: heartbeat_ref}}

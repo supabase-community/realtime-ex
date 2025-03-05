@@ -54,15 +54,14 @@ defmodule Supabase.Realtime.Message do
   ## Parameters
 
   * `channel` - The channel struct
-  * `bindings` - Channel bindings for the subscription
 
   ## Returns
 
   * `map` - Subscription message payload
   """
-  @spec subscription_message(Channel.t(), map()) :: map()
-  def subscription_message(%Channel{} = channel, bindings \\ %{}) do
-    postgres_changes = Map.get(bindings, "postgres_changes", [])
+  @spec subscription_message(Channel.t()) :: map()
+  def subscription_message(%Channel{} = channel) do
+    postgres_changes = Map.get(channel.bindings, "postgres_changes", [])
 
     config = Map.put(channel.params.config, :postgres_changes, postgres_changes)
 
@@ -71,8 +70,7 @@ defmodule Supabase.Realtime.Message do
       event: "phx_join",
       payload: %{
         config: config
-      },
-      ref: channel.ref
+      }
     }
   end
 
@@ -92,8 +90,7 @@ defmodule Supabase.Realtime.Message do
     %{
       topic: channel.topic,
       event: "phx_leave",
-      payload: %{},
-      ref: channel.ref
+      payload: %{}
     }
   end
 
@@ -119,8 +116,7 @@ defmodule Supabase.Realtime.Message do
         type: "broadcast",
         event: event,
         payload: payload
-      },
-      ref: channel.ref
+      }
     }
   end
 
@@ -143,8 +139,19 @@ defmodule Supabase.Realtime.Message do
       event: "access_token",
       payload: %{
         access_token: token
-      },
-      ref: channel.ref
+      }
     }
+  end
+
+  @doc """
+  Constructs a heartbeat message.
+
+  ## Returns
+
+  * `map` - Heartbeat message payload
+  """
+  @spec heartbeat_message() :: map()
+  def heartbeat_message do
+    %{topic: "phoenix", event: "heartbeat", payload: %{}}
   end
 end
