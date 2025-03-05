@@ -208,12 +208,14 @@ defmodule Supabase.Realtime do
         module = opts[:name] || __MODULE__
         client = Keyword.fetch!(opts, :supabase_client)
         heartbeat_interval = opts[:heartbeat_interval] || :timer.seconds(30)
+        store_name = Module.concat(module, Store)
         registry_name = Module.concat(module, Registry)
         conn_name = Module.concat(module, Connection)
         reconnect_after_ms = opts[:reconnect_after_ms]
 
         children =
           [
+            {Channel.Store, name: store_name},
             {Channel.Registry, module: module, name: registry_name},
             {Realtime.Connection,
              name: conn_name,
