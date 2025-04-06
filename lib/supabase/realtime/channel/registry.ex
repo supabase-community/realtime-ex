@@ -11,6 +11,7 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   alias Supabase.Realtime
   alias Supabase.Realtime.Channel
+  alias Supabase.Realtime.Channel.Store
   alias Supabase.Realtime.Message
 
   require Logger
@@ -19,10 +20,10 @@ defmodule Supabase.Realtime.Channel.Registry do
   Registry state holding all subscription information.
   """
   @type state :: %{
-          channels: map(),
           module: module(),
           pending_events: list(),
-          presence_state: map()
+          presence_state: map(),
+          store: pid() | module()
         }
 
   # Client API
@@ -41,8 +42,9 @@ defmodule Supabase.Realtime.Channel.Registry do
   def start_link(opts) do
     name = opts[:name] || __MODULE__
     module = Keyword.fetch!(opts, :module)
+    store = Keyword.fetch!(opts, :store)
 
-    GenServer.start_link(__MODULE__, %{module: module}, name: name)
+    GenServer.start_link(__MODULE__, %{module: module, store: store}, name: name)
   end
 
   @doc """
@@ -114,41 +116,13 @@ defmodule Supabase.Realtime.Channel.Registry do
     GenServer.cast(server, {:handle_message, message})
   end
 
-  @doc """
-  Updates the join reference for a channel.
-
-  ## Parameters
-
-  * `server` - The server PID or name
-  * `channel` - The channel struct
-  * `join_ref` - The join reference
-  """
-  @spec update_join_ref(GenServer.server(), Channel.t(), Realtime.ref()) :: :ok
-  def update_join_ref(server, %Channel{} = channel, join_ref) do
-    GenServer.cast(server, {:update_join_ref, channel, join_ref})
-  end
-
-  @doc """
-  Updates the state of a channel.
-
-  ## Parameters
-
-  * `server` - The server PID or name
-  * `channel` - The channel struct
-  * `state` - The new state
-  """
-  @spec update_channel_state(GenServer.server(), Channel.t(), Realtime.channel_state()) :: :ok
-  def update_channel_state(server, %Channel{} = channel, state) do
-    GenServer.cast(server, {:update_channel_state, channel, state})
-  end
-
   # Server callbacks
 
   @impl true
   def init(init_arg) do
     state = %{
-      channels: %{},
       module: init_arg.module,
+      store: init_arg.store,
       pending_events: [],
       presence_state: %{}
     }
@@ -160,95 +134,69 @@ defmodule Supabase.Realtime.Channel.Registry do
   def handle_call({:create_channel, topic, opts}, _from, state) do
     topic = normalize_topic(topic)
 
-    if channel = find_channel_by_topic(state.channels, topic) do
-      {:reply, {:ok, channel}, state}
-    else
-      channel = Channel.new(topic, self(), opts)
-      updated_channels = Map.put(state.channels, channel.ref, channel)
-      state = %{state | channels: updated_channels}
+    case Store.find_by_topic(state.store, topic) do
+      {:ok, channel} ->
+        {:reply, {:ok, channel}, state}
 
-      {:reply, {:ok, channel}, state}
+      {:error, :not_found} ->
+        channel = Channel.new(topic, self(), opts)
+        {:ok, _} = Store.insert(state.store, channel)
+        {:reply, {:ok, channel}, state}
     end
   end
 
   def handle_call({:subscribe, channel, type, filter}, _from, state) do
-    if channel = Map.get(state.channels, channel.ref) do
-      updated_channel = Channel.add_binding(channel, type, filter)
-      updated_channels = Map.put(state.channels, channel.ref, updated_channel)
-      state = %{state | channels: updated_channels}
+    case Store.find_by_ref(state.store, channel.ref) do
+      {:ok, found_channel} ->
+        {:ok, channel} = Store.add_binding(state.store, found_channel, type, filter)
+        {:reply, :ok, state, {:continue, {:join, channel}}}
 
-      {:reply, :ok, state, {:continue, {:join, channel}}}
-    else
-      {:reply, {:error, :channel_not_found}, state}
+      {:error, :not_found} ->
+        {:reply, {:error, :channel_not_found}, state}
     end
   end
 
   def handle_call({:unsubscribe, channel}, _from, state) do
-    if channel = Map.get(state.channels, channel.ref) do
-      updated_channel = Channel.update_state(channel, :leaving)
-      updated_channels = Map.put(state.channels, channel.ref, updated_channel)
-      state = %{state | channels: updated_channels}
+    case Store.find_by_ref(state.store, channel.ref) do
+      {:ok, found_channel} ->
+        {:ok, channel} = Store.update_state(state.store, found_channel, :leaving)
+        {:reply, :ok, state, {:continue, {:leave, channel}}}
 
-      {:reply, :ok, state, {:continue, {:leave, channel}}}
-    else
-      {:reply, {:error, :channel_not_found}, state}
+      {:error, :not_found} ->
+        {:reply, {:error, :channel_not_found}, state}
     end
   end
 
   def handle_call(:remove_all_channels, _from, state) do
-    updated_channels =
-      Map.new(state.channels, fn {ref, channel} ->
-        {ref, Channel.update_state(channel, :leaving)}
-      end)
-
-    state = %{state | channels: updated_channels}
-
-    for {_, channel} <- state.channels, do: unsubscribe(self(), channel)
+    for channel <- Store.all(state.store), do: unsubscribe(self(), channel)
 
     {:reply, :ok, state}
   end
 
   @impl true
-  def handle_cast({:handle_message, %{"event" => event, "topic" => topic} = msg}, state) do
-    %{"payload" => payload} = msg
-    matching_channels = filter_channels_by_topic(state.channels, topic)
+  def handle_cast({:handle_message, %{"event" => event, "payload" => payload} = msg}, state) do
+    matching_channels = Store.find_all_by_topic(state.store, msg["topic"])
 
     case event do
-      "phx_reply" -> handle_reply(matching_channels, msg, state)
+      "phx_close" -> handle_leave(msg, state)
+      "phx_reply" -> handle_reply(msg, state)
       _ -> handle_event(matching_channels, event, payload, state)
-    end
-  end
-
-  def handle_cast({:update_join_ref, channel, join_ref}, state) do
-    if channel = Map.get(state.channels, channel.ref) do
-      updated_channel = Channel.set_join_ref(channel, join_ref)
-      updated_channels = Map.put(state.channels, channel.ref, updated_channel)
-
-      {:noreply, %{state | channels: updated_channels}}
-    else
-      {:noreply, state}
-    end
-  end
-
-  def handle_cast({:update_channel_state, channel, new_state}, state) do
-    if channel = Map.get(state.channels, channel.ref) do
-      updated_channel = Channel.update_state(channel, new_state)
-      updated_channels = Map.put(state.channels, channel.ref, updated_channel)
-
-      {:noreply, %{state | channels: updated_channels}}
-    else
-      {:noreply, state}
     end
   end
 
   @impl true
   def handle_continue({:join, channel}, state) do
-    state.module.send(channel, Message.subscription_message(channel))
+    if not Channel.joined?(channel) and not Channel.joining?(channel) do
+      Logger.debug("[#{channel.topic}] Joining #{channel.ref}")
+      {:ok, channel} = Store.update_state(state.store, channel, :joining)
+      state.module.send(channel, Message.subscription_message(channel))
+    end
 
     {:noreply, state}
   end
 
   def handle_continue({:leave, channel}, state) do
+    Logger.debug("[#{channel.topic}] Leaving #{channel.ref}")
     state.module.send(channel, Message.unsubscribe_message(channel))
 
     {:noreply, state}
@@ -264,43 +212,68 @@ defmodule Supabase.Realtime.Channel.Registry do
     end
   end
 
-  defp filter_channels_by_topic(channels, topic) do
-    channels
-    |> Map.values()
-    |> Enum.filter(&(&1.topic == topic))
-  end
-
-  defp find_channel_by_topic(channels, topic) do
-    channels
-    |> Map.values()
-    |> Enum.find(fn channel -> channel.topic == topic end)
-  end
-
-  defp handle_reply(channels, %{"ref" => join_ref} = msg, state) do
+  defp handle_leave(%{"ref" => join_ref, "topic" => topic} = msg, state) do
     %{"payload" => %{"status" => status}} = msg
 
-    Enum.reduce(channels, state.channels, fn matched, acc ->
-      case status do
-        "ok" when matched.state == :joining ->
-          Logger.debug("[#{matched.topic}] Successfully joined channel #{matched.ref}")
+    case Store.find_by_join_ref(state.store, join_ref) do
+      {:ok, channel} ->
+        handle_channel_leaving(channel, status, state)
 
-          matched
-          |> Channel.update_state(:joined)
-          |> Channel.set_join_ref(join_ref)
+      {:error, :not_found} ->
+        Logger.debug("[#{topic}] Channel not found for leave message with ref #{join_ref}")
+    end
 
-        "ok" ->
-          Channel.update_state(matched, :errored)
+    {:noreply, state}
+  end
 
-        s when s in ~w(error timeout) ->
-          Logger.error("[#{matched.topic}] Failed to join channel #{matched.ref}: #{s}")
-          Channel.update_state(matched, :errored)
+  defp handle_channel_leaving(channel, "ok", state) when channel.state == :leaving do
+    Logger.debug("[#{channel.topic}] Successfully left #{channel.ref}")
+    Store.remove(state.store, channel)
+  end
 
-        _ ->
-          matched
-      end
-      |> then(&Map.put(acc, matched.ref, &1))
-    end)
-    |> then(&{:noreply, %{state | channels: &1}})
+  defp handle_channel_leaving(channel, "ok", _state) do
+    Logger.debug("[#{channel.topic}] Ignoring leave message for #{channel.ref} with status ok")
+  end
+
+  defp handle_channel_leaving(channel, status, state) when status in ~w(error timeout) do
+    Logger.error("[#{channel.topic}] Failed to leave channel #{channel.ref}: #{status}")
+    Store.update_state(state.store, channel, :errored)
+  end
+
+  defp handle_channel_leaving(channel, status, _state) do
+    Logger.debug(
+      "[#{channel.topic}] Ignoring leave message for #{channel.ref} with status #{status}"
+    )
+  end
+
+  defp handle_reply(%{"ref" => join_ref} = msg, state) do
+    %{"payload" => %{"status" => status}} = msg
+
+    case Store.find_by_join_ref(state.store, join_ref) do
+      {:ok, channel} ->
+        handle_channel_reply(channel, status, state)
+
+      {:error, :not_found} ->
+        Logger.debug("Channel not found for reply message with ref #{join_ref}")
+    end
+
+    {:noreply, state}
+  end
+
+  defp handle_channel_reply(channel, "ok", state) do
+    Logger.debug("[#{channel.topic}] Successfully joined #{channel.ref}")
+    Store.update_state(state.store, channel, :joined)
+  end
+
+  defp handle_channel_reply(channel, status, state) when status in ~w(error timeout) do
+    Logger.error("[#{channel.topic}] Failed to join channel #{channel.ref}: #{status}")
+    Store.update_state(state.store, channel, :errored)
+  end
+
+  defp handle_channel_reply(channel, status, _state) do
+    Logger.debug(
+      "[#{channel.topic}] Ignoring reply message for #{channel.ref} with status #{status}"
+    )
   end
 
   defp handle_event(channels, event, payload, state) when is_database_event(event) do

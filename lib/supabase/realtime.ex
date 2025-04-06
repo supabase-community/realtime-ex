@@ -216,10 +216,11 @@ defmodule Supabase.Realtime do
         children =
           [
             {Channel.Store, name: store_name},
-            {Channel.Registry, module: module, name: registry_name},
+            {Channel.Registry, module: module, name: registry_name, store: store_name},
             {Realtime.Connection,
              name: conn_name,
              registry: registry_name,
+             store: store_name,
              client: client,
              heartbeat_interval: heartbeat_interval,
              reconnect_after_ms: reconnect_after_ms}

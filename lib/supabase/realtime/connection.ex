@@ -13,6 +13,7 @@ defmodule Supabase.Realtime.Connection do
 
   alias Supabase.Realtime
   alias Supabase.Realtime.Channel
+  alias Supabase.Realtime.Channel.Store
   alias Supabase.Realtime.Message
 
   require Logger
@@ -23,10 +24,10 @@ defmodule Supabase.Realtime.Connection do
   @type state :: %{
           url: String.t(),
           params: map(),
-          registry: atom(),
+          registry: atom() | pid(),
+          store: atom() | pid(),
           socket: pid() | nil,
           status: Realtime.connection_state(),
-          pending: map(),
           stream_ref: reference() | nil,
           reconnect_timer: reference() | nil,
           heartbeat_timer: reference() | nil,
@@ -54,6 +55,7 @@ defmodule Supabase.Realtime.Connection do
     name = opts[:name] || __MODULE__
     _ = Keyword.fetch!(opts, :registry)
     _ = Keyword.fetch!(opts, :client)
+    _ = Keyword.fetch!(opts, :store)
 
     GenServer.start_link(__MODULE__, opts, name: name)
   end
@@ -87,6 +89,7 @@ defmodule Supabase.Realtime.Connection do
   @impl true
   def init(opts) do
     client = opts[:client]
+    store = opts[:store]
     registry = opts[:registry]
     heartbeat_interval = opts[:heartbeat_interval] || :timer.seconds(30)
     reconnect_function = opts[:reconnect_after_ms] || (&default_reconnect_after_ms/1)
@@ -94,10 +97,10 @@ defmodule Supabase.Realtime.Connection do
     state = %{
       client: client,
       registry: registry,
+      store: store,
       socket: nil,
       status: :closed,
       stream_ref: nil,
-      pending: %{},
       reconnect_timer: nil,
       heartbeat_timer: nil,
       heartbeat_interval: heartbeat_interval,
@@ -154,9 +157,9 @@ defmodule Supabase.Realtime.Connection do
   end
 
   def handle_call({:send_message, channel, payload}, _from, state) do
-    {:ok, message_ref} = send_message_to_topic(channel.topic, payload, state)
+    :ok = send_message_to_topic(channel, payload, state)
 
-    {:reply, :ok, %{state | pending: Map.put(state.pending, message_ref, channel)}}
+    {:reply, :ok, state}
   end
 
   @impl true
@@ -218,6 +221,14 @@ defmodule Supabase.Realtime.Connection do
         Logger.error("[#{__MODULE__}]: Failed to decode message: #{inspect(reason)}")
         {:noreply, state}
     end
+  end
+
+  def handle_info(
+        {:gun_ws, socket, stream, {:close, _, _}},
+        %{socket: socket, stream_ref: stream} = state
+      ) do
+    Logger.debug("[#{__MODULE__}]: WebSocket closed")
+    {:noreply, %{state | status: :closed}}
   end
 
   def handle_info(:heartbeat, %{socket: nil, status: status} = state) when status != :open do
@@ -352,19 +363,30 @@ defmodule Supabase.Realtime.Connection do
     "msg:" <> (:crypto.strong_rand_bytes(10) |> Base.encode16(case: :lower))
   end
 
-  defp send_message_to_topic(topic, payload, state) do
+  defp send_message_to_topic(channel, payload, state) do
+    channel = ensure_latest_channel(channel, state)
     message_ref = payload[:ref] || generate_join_ref()
 
     message = %{
-      topic: topic,
+      topic: channel.topic,
       event: payload[:event] || "phx_message",
       payload: payload[:payload] || %{},
       ref: message_ref
     }
 
+    Logger.debug("[#{__MODULE__}]: Sending message: #{inspect(message)}")
+
     {:ok, encoded} = Message.encode(message)
     :ok = :gun.ws_send(state.socket, state.stream_ref, {:text, encoded})
+    {:ok, _} = Store.update_join_ref(state.store, channel, message_ref)
 
-    {:ok, message_ref}
+    :ok
+  end
+
+  defp ensure_latest_channel(channel, state) do
+    case Store.find_by_ref(state.store, channel.ref) do
+      {:ok, channel} -> channel
+      _ -> channel
+    end
   end
 end
