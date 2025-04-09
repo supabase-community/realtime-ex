@@ -45,8 +45,8 @@ defmodule Supabase.Realtime do
       )
   """
 
+  alias Supabase.Realtime
   alias Supabase.Realtime.Channel
-  alias Supabase.Realtime.Connection
 
   @typedoc """
   Connection states for the WebSocket client.
@@ -205,8 +205,75 @@ defmodule Supabase.Realtime do
 
       @impl Supervisor
       def init(opts) do
-        {:ok, opts}
+        module = opts[:name] || __MODULE__
+        client = Keyword.fetch!(opts, :supabase_client)
+        heartbeat_interval = opts[:heartbeat_interval] || :timer.seconds(30)
+        store_name = Module.concat(module, Store)
+        registry_name = Module.concat(module, Registry)
+        conn_name = Module.concat(module, Connection)
+        reconnect_after_ms = opts[:reconnect_after_ms]
+
+        children =
+          [
+            {Channel.Store, name: store_name},
+            {Channel.Registry, module: module, name: registry_name, store: store_name},
+            {Realtime.Connection,
+             name: conn_name,
+             registry: registry_name,
+             store: store_name,
+             client: client,
+             heartbeat_interval: heartbeat_interval,
+             reconnect_after_ms: reconnect_after_ms}
+          ]
+
+        Supervisor.init(children, strategy: :one_for_one)
       end
+
+      @doc """
+      Check `Supabase.Realtime.channel/3` for more information.
+      """
+      def channel(topic, opts \\ []) do
+        with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
+          Realtime.channel(registry, topic, opts)
+        end
+      end
+
+      @doc """
+      Check `Supabase.Realtime.remove_all_channels/1` for more information.
+      """
+      def remove_all_channels do
+        with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
+          Realtime.remove_all_channels(registry)
+        end
+      end
+
+      @doc """
+      Check `Supabase.Realtime.connection_state/1` for more information.
+      """
+      def connection_state do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.connection_state(conn)
+        end
+      end
+
+      @doc """
+      Check `Supabase.Realtime.on/3` for more information.
+      """
+      defdelegate on(channel, type, filter), to: Realtime
+
+      @doc """
+      Check `Supabase.Realtime.send/2` for more information.
+      """
+      def send(channel, payload) do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.send(conn, channel, payload)
+        end
+      end
+
+      @doc """
+      Check `Supabase.Realtime.unsubscribe/1` for more information.
+      """
+      defdelegate unsubscribe(channel), to: Realtime
     end
   end
 
@@ -223,7 +290,7 @@ defmodule Supabase.Realtime do
   """
   @spec start_link(module(), [start_option()]) :: Supervisor.on_start()
   def start_link(module, opts \\ []) do
-    Supervisor.start_link(module, opts)
+    Supervisor.start_link(module, opts, name: module)
   end
 
   @doc """
@@ -264,7 +331,7 @@ defmodule Supabase.Realtime do
   @spec on(channel(), String.t(), event_filter()) :: :ok | {:error, term()}
   def on(%Channel{} = channel, type, filter)
       when is_binary(type) and (is_list(filter) or is_map(filter)) do
-    with pid when is_pid(pid) <- ensure_pid(channel.client) do
+    with pid when is_pid(pid) <- ensure_pid(channel.registry) do
       Channel.Registry.subscribe(pid, channel, type, filter)
     end
   end
@@ -274,6 +341,7 @@ defmodule Supabase.Realtime do
 
   ## Parameters
 
+  * `conn` - The connection PID or name
   * `channel` - The channel struct
   * `payload` - The message payload
   * `opts` - Send options (e.g., timeout)
@@ -282,11 +350,10 @@ defmodule Supabase.Realtime do
 
       Realtime.send(channel, type: "broadcast", event: "new_message", payload: %{body: "Hello"})
   """
-  @spec send(channel(), map(), keyword()) :: :ok | {:error, term()}
-  def send(%Channel{} = channel, payload, _opts \\ []) when is_map(payload) do
-    with pid when is_pid(pid) <- ensure_pid(channel.client) do
-      raise "unimplemented"
-      # Connection.send_message(pid, channel, payload, opts)
+  @spec send(pid | module, channel(), map()) :: :ok | {:error, term()}
+  def send(conn, %Channel{} = channel, payload) when is_map(payload) do
+    with pid when is_pid(pid) <- ensure_pid(conn) do
+      Realtime.Connection.send_message(pid, channel, payload)
     end
   end
 
@@ -299,7 +366,7 @@ defmodule Supabase.Realtime do
   """
   @spec unsubscribe(channel()) :: :ok | {:error, term()}
   def unsubscribe(%Channel{} = channel) do
-    with pid when is_pid(pid) <- ensure_pid(channel.client) do
+    with pid when is_pid(pid) <- ensure_pid(channel.registry) do
       Channel.Registry.unsubscribe(pid, channel)
     end
   end
@@ -309,11 +376,11 @@ defmodule Supabase.Realtime do
 
   ## Parameters
 
-  * `client` - The client module or PID
+  * `registry` - The channel registry module or PID
   """
   @spec remove_all_channels(client() | t()) :: :ok | {:error, term()}
-  def remove_all_channels(client) do
-    with pid when is_pid(pid) <- ensure_pid(client) do
+  def remove_all_channels(registry) do
+    with pid when is_pid(pid) <- ensure_pid(registry) do
       Channel.Registry.remove_all_channels(pid)
     end
   end
@@ -328,8 +395,41 @@ defmodule Supabase.Realtime do
   @spec connection_state(client() | t()) :: connection_state()
   def connection_state(client) do
     with pid when is_pid(pid) <- ensure_pid(client) do
-      raise "unimplemented"
-      # Connection.state(pid)
+      Realtime.Connection.state(pid)
+    end
+  end
+
+  @doc """
+  Fetches the channel registry for a client.
+
+  ## Parameters
+
+  * `realtime` - The client module or PID
+  """
+  def fetch_channel_registry(realtime) do
+    registry_name = Module.concat(realtime, Registry)
+
+    if pid = Process.whereis(registry_name) do
+      {:ok, pid}
+    else
+      {:error, :registry_not_found}
+    end
+  end
+
+  @doc """
+  Fetches the connection PID for a client.
+
+  ## Parameters
+
+  * `realtime` - The client module or PID
+  """
+  def fetch_connection(realtime) do
+    conn_name = Module.concat(realtime, Connection)
+
+    if pid = Process.whereis(conn_name) do
+      {:ok, pid}
+    else
+      {:error, :connection_not_found}
     end
   end
 
