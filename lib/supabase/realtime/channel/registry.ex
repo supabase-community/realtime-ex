@@ -189,7 +189,7 @@ defmodule Supabase.Realtime.Channel.Registry do
     if not Channel.joined?(channel) and not Channel.joining?(channel) do
       Logger.debug("[#{channel.topic}] Joining #{channel.ref}")
       {:ok, channel} = Store.update_state(state.store, channel, :joining)
-      state.module.send(channel, Message.subscription_message(channel))
+      state.module.send_message(channel, Message.subscription_message(channel))
     end
 
     {:noreply, state}
@@ -197,7 +197,7 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   def handle_continue({:leave, channel}, state) do
     Logger.debug("[#{channel.topic}] Leaving #{channel.ref}")
-    state.module.send(channel, Message.unsubscribe_message(channel))
+    state.module.send_message(channel, Message.unsubscribe_message(channel))
 
     {:noreply, state}
   end

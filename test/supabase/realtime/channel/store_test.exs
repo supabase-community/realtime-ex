@@ -1,13 +1,16 @@
 defmodule Supabase.Realtime.Channel.StoreTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
   alias Supabase.Realtime.Channel
   alias Supabase.Realtime.Channel.Store
 
   setup do
-    # Start a store with a unique name for test isolation
-    store_name = :"Store#{System.unique_integer([:positive])}"
-    start_supervised!({Store, name: store_name})
+    # Start a store with unique name and table name for test isolation
+    unique_id = System.unique_integer([:positive])
+    store_name = :"Store#{unique_id}"
+    table_name = :"supabase_realtime_channels_#{unique_id}"
+
+    start_supervised!({Store, name: store_name, table_name: table_name})
 
     channel1 = Channel.new("test:channel1", self())
     channel2 = Channel.new("test:channel2", self())
@@ -23,11 +26,9 @@ defmodule Supabase.Realtime.Channel.StoreTest do
   end
 
   describe "initialization" do
-    test "starts with an empty table" do
-      store_name = :"EmptyStore#{System.unique_integer([:positive])}"
-      {:ok, _pid} = Store.start_link(name: store_name, table_name: :empty_table)
-
-      assert Store.all(store_name) == []
+    test "empty store has no channels", %{store: store} do
+      # Use the store from setup which is already supervised
+      assert Store.all(store) == []
     end
   end
 
