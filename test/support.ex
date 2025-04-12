@@ -34,7 +34,7 @@ defmodule Support.Supervisor do
   def init(:ok) do
     children = [
       Support.Client,
-      {Support.Realtime, supabase_client: Support.Client, heartbeat_interval: :timer.hours(3)}
+      {Support.Realtime, supabase_client: Support.Client, heartbeat_interval: to_timeout(hour: 3)}
     ]
 
     Supervisor.init(children, strategy: :one_for_one)

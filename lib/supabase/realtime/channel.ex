@@ -107,8 +107,7 @@ defmodule Supabase.Realtime.Channel do
   * `%Channel{}` - Updated channel struct
   """
   @spec update_state(t(), Realtime.channel_state()) :: t()
-  def update_state(%__MODULE__{} = channel, state)
-      when state in [:closed, :errored, :joined, :joining, :leaving] do
+  def update_state(%__MODULE__{} = channel, state) when state in [:closed, :errored, :joined, :joining, :leaving] do
     %{channel | state: state}
   end
 
@@ -296,6 +295,6 @@ defmodule Supabase.Realtime.Channel do
   end
 
   defp generate_ref do
-    "channel:" <> (:crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower))
+    "channel:" <> (16 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower))
   end
 end

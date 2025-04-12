@@ -75,6 +75,19 @@ defmodule Supabase.Realtime.Connection do
   end
 
   @doc """
+  Updates the authentication token for all channels.
+
+  ## Parameters
+
+  * `server` - The server PID or name
+  * `token` - The new authentication token
+  """
+  @spec set_auth(GenServer.server(), String.t()) :: :ok | {:error, term()}
+  def set_auth(server, token) when is_binary(token) do
+    GenServer.call(server, {:set_auth, token})
+  end
+
+  @doc """
   Gets the current connection state.
 
   ## Parameters
@@ -91,7 +104,7 @@ defmodule Supabase.Realtime.Connection do
     client = opts[:client]
     store = opts[:store]
     registry = opts[:registry]
-    heartbeat_interval = opts[:heartbeat_interval] || :timer.seconds(30)
+    heartbeat_interval = opts[:heartbeat_interval] || to_timeout(second: 30)
     reconnect_function = opts[:reconnect_after_ms] || (&default_reconnect_after_ms/1)
 
     state = %{
@@ -131,7 +144,7 @@ defmodule Supabase.Realtime.Connection do
   def handle_continue(:upgrade, %{socket: socket} = state) do
     {:ok, client} = state.client.get_client()
     uri = build_url(client)
-    path = uri.path <> if(uri.query != "", do: "?" <> uri.query, else: "")
+    path = uri.path <> if(uri.query == "", do: "", else: "?" <> uri.query)
 
     headers = [
       {~c"user-agent", ~c"SupabasePotion/#{version()}"},
@@ -147,17 +160,35 @@ defmodule Supabase.Realtime.Connection do
   @impl true
   def handle_call(:state, _from, state), do: {:reply, state.status, state}
 
-  def handle_call({:send_message, channel, _}, _from, %{status: status, socket: nil} = state)
-      when status != :open do
-    Logger.warning(
-      "[#{inspect(__MODULE__)}]: Not connected, ignoring message for channel: #{inspect(channel)}"
-    )
+  def handle_call({:send_message, channel, _}, _from, %{status: status, socket: nil} = state) when status != :open do
+    Logger.warning("[#{inspect(__MODULE__)}]: Not connected, ignoring message for channel: #{inspect(channel)}")
 
     {:reply, {:error, :not_connected}, state}
   end
 
   def handle_call({:send_message, channel, payload}, _from, state) do
     :ok = send_message_to_topic(channel, payload, state)
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:set_auth, _token}, _from, %{socket: nil, status: status} = state) when status != :open do
+    Logger.warning("[#{inspect(__MODULE__)}]: Not connected, ignoring auth token update")
+
+    {:reply, {:error, :not_connected}, state}
+  end
+
+  def handle_call({:set_auth, token}, _from, state) do
+    # Get all channels from the store and update their auth tokens
+    channels = Store.all(state.store)
+
+    # For each channel, send an access_token message
+    Enum.each(channels, fn channel ->
+      if Channel.joined?(channel) do
+        message = Message.access_token_message(channel, token)
+        :ok = send_message_to_topic(channel, message, state)
+      end
+    end)
 
     {:reply, :ok, state}
   end
@@ -173,30 +204,20 @@ defmodule Supabase.Realtime.Connection do
 
   def handle_info({:gun_response, socket, _, _, status, headers}, %{socket: socket} = state) do
     Logger.debug("[#{__MODULE__}]: Failed to upgrade to websocket: #{inspect(status)}")
-    # maybe try to upgrade again? stop? i dunno
     {:stop, {:error, {:failed_to_upgrade, status, headers}}, %{state | status: :closed}}
   end
 
-  def handle_info(
-        {:gun_error, socket, stream, reason},
-        %{socket: socket, stream_ref: stream} = state
-      ) do
+  def handle_info({:gun_error, socket, stream, reason}, %{socket: socket, stream_ref: stream} = state) do
     Logger.error("[#{__MODULE__}]: Connection error: #{inspect(reason)}")
     {:stop, {:error, reason}, %{state | status: :closed}}
   end
 
-  def handle_info(
-        {:gun_upgrade, socket, stream, ["websocket"], _headers},
-        %{socket: socket, stream_ref: stream} = state
-      ) do
+  def handle_info({:gun_upgrade, socket, stream, ["websocket"], _headers}, %{socket: socket, stream_ref: stream} = state) do
     Logger.debug("[#{__MODULE__}]: Connection upgraded to websocket with success")
     {:noreply, %{state | status: :open}}
   end
 
-  def handle_info(
-        {:gun_down, socket, _protocol, reason, _killed_streams},
-        %{socket: socket} = state
-      ) do
+  def handle_info({:gun_down, socket, _protocol, reason, _killed_streams}, %{socket: socket} = state) do
     Logger.debug("[#{__MODULE__}]: Connection down: #{inspect(reason)}")
     updated_state = %{state | status: :closed}
 
@@ -209,10 +230,7 @@ defmodule Supabase.Realtime.Connection do
     {:noreply, %{updated_state | heartbeat_timer: nil, reconnect_timer: reconnect_timer}}
   end
 
-  def handle_info(
-        {:gun_ws, socket, stream, {:text, data}},
-        %{socket: socket, stream_ref: stream} = state
-      ) do
+  def handle_info({:gun_ws, socket, stream, {:text, data}}, %{socket: socket, stream_ref: stream} = state) do
     case Message.decode(data) do
       {:ok, message} ->
         handle_ws_message(message, state)
@@ -223,10 +241,7 @@ defmodule Supabase.Realtime.Connection do
     end
   end
 
-  def handle_info(
-        {:gun_ws, socket, stream, {:close, _, _}},
-        %{socket: socket, stream_ref: stream} = state
-      ) do
+  def handle_info({:gun_ws, socket, stream, {:close, _, _}}, %{socket: socket, stream_ref: stream} = state) do
     Logger.debug("[#{__MODULE__}]: WebSocket closed")
     {:noreply, %{state | status: :closed}}
   end
@@ -251,8 +266,7 @@ defmodule Supabase.Realtime.Connection do
       {:ok, socket, updated_state} ->
         heartbeat_timer = schedule_heartbeat(state.heartbeat_interval)
 
-        {:noreply,
-         %{updated_state | socket: socket, heartbeat_timer: heartbeat_timer, reconnect_timer: nil}}
+        {:noreply, %{updated_state | socket: socket, heartbeat_timer: heartbeat_timer, reconnect_timer: nil}}
 
       {:error, _reason, updated_state} ->
         reconnect_timer = schedule_reconnect(updated_state)
@@ -307,10 +321,11 @@ defmodule Supabase.Realtime.Connection do
   defp build_url(%Supabase.Client{} = client) do
     query = URI.encode_query(%{apikey: client.api_key, vsn: "1.0.0"})
 
-    URI.new!(client.realtime_url)
+    client.realtime_url
+    |> URI.new!()
     |> URI.append_path("/websocket")
     |> URI.append_query(query)
-    |> then(&update_uri_scheme/1)
+    |> update_uri_scheme()
   end
 
   defp update_uri_scheme(%URI{scheme: "http"} = uri), do: %{uri | scheme: "ws"}
@@ -326,8 +341,8 @@ defmodule Supabase.Realtime.Connection do
     Process.send_after(self(), :reconnect, reconnect_time)
   end
 
-  @max_backoff :timer.seconds(10)
-  @base_backoff :timer.seconds(1)
+  @max_backoff to_timeout(second: 10)
+  @base_backoff to_timeout(second: 1)
 
   defp default_reconnect_after_ms(tries) do
     min(@max_backoff, (@base_backoff * 2) ** tries)
@@ -360,7 +375,7 @@ defmodule Supabase.Realtime.Connection do
   end
 
   defp generate_join_ref do
-    "msg:" <> (:crypto.strong_rand_bytes(10) |> Base.encode16(case: :lower))
+    "msg:" <> (10 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower))
   end
 
   defp send_message_to_topic(channel, payload, state) do

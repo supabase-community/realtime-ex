@@ -164,7 +164,8 @@ defmodule Supabase.Realtime.ChannelTest do
   describe "remove_binding/3" do
     setup do
       channel =
-        Channel.new("test_topic", self())
+        "test_topic"
+        |> Channel.new(self())
         |> Channel.add_binding("postgres_changes", %{
           event: "INSERT",
           schema: "public",
