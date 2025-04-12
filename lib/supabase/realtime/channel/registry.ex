@@ -173,6 +173,10 @@ defmodule Supabase.Realtime.Channel.Registry do
     {:reply, :ok, state}
   end
 
+  def handle_call(:get_presence_state, _from, state) do
+    {:reply, state.presence_state, state}
+  end
+
   @impl true
   def handle_cast({:handle_message, %{"event" => event, "payload" => payload} = msg}, state) do
     matching_channels = Store.find_all_by_topic(state.store, msg["topic"])
@@ -241,9 +245,7 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   defp handle_channel_leaving(channel, status, _state) do
-    Logger.debug(
-      "[#{channel.topic}] Ignoring leave message for #{channel.ref} with status #{status}"
-    )
+    Logger.debug("[#{channel.topic}] Ignoring leave message for #{channel.ref} with status #{status}")
   end
 
   defp handle_reply(%{"ref" => join_ref} = msg, state) do
@@ -271,35 +273,87 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   defp handle_channel_reply(channel, status, _state) do
-    Logger.debug(
-      "[#{channel.topic}] Ignoring reply message for #{channel.ref} with status #{status}"
-    )
+    Logger.debug("[#{channel.topic}] Ignoring reply message for #{channel.ref} with status #{status}")
   end
 
   defp handle_event(channels, event, payload, state) when is_database_event(event) do
-    db_event_type = String.downcase(event) |> String.to_atom()
+    db_event_type = event |> String.downcase() |> String.to_atom()
+    dispatch_event(state, channels, {:postgres_changes, db_event_type, payload})
+    {:noreply, state}
+  end
 
-    if channels != [] and function_exported?(state.module, :handle_event, 1) do
-      Task.start(fn ->
-        # enforce event delivery/processing
-        :ok = state.module.handle_event({:postgres_changes, db_event_type, payload})
-      end)
-    else
-      Logger.warning("No handle_event/1 callback defined in #{state.module}")
-    end
+  defp handle_event(channels, "presence_state", payload, state) do
+    new_state = %{state | presence_state: Map.get(payload, "state", %{})}
+    dispatch_event(new_state, channels, {:presence, :sync, new_state.presence_state})
+    {:noreply, new_state}
+  end
 
+  defp handle_event(channels, "presence_diff", payload, state) do
+    joins = Map.get(payload, "joins", %{})
+    leaves = Map.get(payload, "leaves", %{})
+
+    # Update presence state
+    new_state =
+      state
+      |> add_presence_joins(joins)
+      |> remove_presence_leaves(leaves)
+
+    # Dispatch joins/leaves events if present
+    if map_size(joins) != 0,
+      do: dispatch_event(new_state, channels, {:presence, :join, joins})
+
+    if map_size(leaves) != 0,
+      do: dispatch_event(new_state, channels, {:presence, :leave, leaves})
+
+    # Always dispatch the sync event with updated state
+    dispatch_event(new_state, channels, {:presence, :sync, new_state.presence_state})
+
+    {:noreply, new_state}
+  end
+
+  defp handle_event(channels, _event, %{"type" => "presence", "event" => presence_event, "payload" => payload}, state) do
+    # Handle presence events from message payload
+    presence_type = String.to_atom(presence_event)
+    dispatch_event(state, channels, {:presence, presence_type, payload})
     {:noreply, state}
   end
 
   defp handle_event(channels, event, payload, state) do
+    # Default to broadcast handling
+    dispatch_event(state, channels, {:broadcast, event, payload})
+    {:noreply, state}
+  end
+
+  # Helper to dispatch events to the callback module if available
+  defp dispatch_event(state, channels, event) do
     if channels != [] and function_exported?(state.module, :handle_event, 1) do
       Task.start(fn ->
-        :ok = state.module.handle_event({:broadcast, event, payload})
+        :ok = state.module.handle_event(event)
       end)
     else
       Logger.warning("No handle_event/1 callback defined in #{state.module}")
     end
+  end
 
-    {:noreply, state}
+  # Helper to add presences (joins)
+  defp add_presence_joins(state, joins) do
+    presences =
+      Enum.reduce(joins, state.presence_state, fn {key, presence}, acc ->
+        Map.put(acc, key, presence)
+      end)
+
+    %{state | presence_state: presences}
+  end
+
+  # Helper to remove presences (leaves)
+  defp remove_presence_leaves(state, leaves) do
+    presences =
+      leaves
+      |> Map.keys()
+      |> Enum.reduce(state.presence_state, fn key, acc ->
+        Map.delete(acc, key)
+      end)
+
+    %{state | presence_state: presences}
   end
 end

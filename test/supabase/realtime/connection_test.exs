@@ -2,6 +2,7 @@ defmodule Supabase.Realtime.ConnectionTest do
   # Using async: false as we're mocking global modules
   use ExUnit.Case, async: false
   use Mimic
+
   import ExUnit.CaptureLog
 
   alias Supabase.Realtime.Channel.Registry
@@ -12,6 +13,7 @@ defmodule Supabase.Realtime.ConnectionTest do
 
   # Mock client for tests
   defmodule MockClient do
+    @moduledoc false
     def get_client do
       {:ok,
        %Supabase.Client{

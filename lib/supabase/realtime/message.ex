@@ -154,4 +154,52 @@ defmodule Supabase.Realtime.Message do
   def heartbeat_message do
     %{topic: "phoenix", event: "heartbeat", payload: %{}}
   end
+
+  @doc """
+  Constructs a presence tracking message.
+
+  ## Parameters
+
+  * `channel` - The channel struct
+  * `presence_state` - The presence state to track
+
+  ## Returns
+
+  * `map` - Presence track message payload
+  """
+  @spec presence_track_message(Channel.t(), map()) :: map()
+  def presence_track_message(%Channel{} = channel, presence_state) do
+    %{
+      topic: channel.topic,
+      event: "presence",
+      payload: %{
+        type: "presence",
+        event: "track",
+        payload: presence_state
+      }
+    }
+  end
+
+  @doc """
+  Constructs a presence untrack message.
+
+  ## Parameters
+
+  * `channel` - The channel struct
+
+  ## Returns
+
+  * `map` - Presence untrack message payload
+  """
+  @spec presence_untrack_message(Channel.t()) :: map()
+  def presence_untrack_message(%Channel{} = channel) do
+    %{
+      topic: channel.topic,
+      event: "presence",
+      payload: %{
+        type: "presence",
+        event: "untrack"
+      }
+    }
+  end
 end

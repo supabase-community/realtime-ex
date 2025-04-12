@@ -15,9 +15,7 @@ defmodule Supabase.Realtime.Channel.RegistryTest do
     _store_pid = start_supervised!({Store, name: store_name, table_name: table_name})
 
     registry_pid =
-      start_supervised!(
-        {Registry, module: RealtimeTest, name: :"TestRegistry#{unique_id}", store: store_name}
-      )
+      start_supervised!({Registry, module: RealtimeTest, name: :"TestRegistry#{unique_id}", store: store_name})
 
     %{registry: registry_pid, store: store_name}
   end
