@@ -8,7 +8,7 @@ defmodule Supabase.Realtime.MixProject do
     [
       app: :supabase_realtime,
       version: @version,
-      elixir: "~> 1.18",
+      elixir: "~> 1.17",
       start_permanent: Mix.env() == :prod,
       deps: deps(),
       docs: docs(),
