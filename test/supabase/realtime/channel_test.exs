@@ -10,7 +10,7 @@ defmodule Supabase.Realtime.ChannelTest do
 
       assert %Channel{} = channel
       assert channel.topic == "realtime:test_topic"
-      assert channel.client == client
+      assert channel.registry == client
       assert channel.state == :closed
       assert channel.timeout == 10_000
       assert is_map(channel.bindings)
@@ -37,7 +37,7 @@ defmodule Supabase.Realtime.ChannelTest do
         Channel.new("test_topic", client, params: custom_params, timeout: 5000, ref: custom_ref)
 
       assert channel.topic == "realtime:test_topic"
-      assert channel.client == client
+      assert channel.registry == client
       assert channel.timeout == 5000
       assert channel.ref == custom_ref
       assert channel.params.user_id == 123
@@ -164,7 +164,8 @@ defmodule Supabase.Realtime.ChannelTest do
   describe "remove_binding/3" do
     setup do
       channel =
-        Channel.new("test_topic", self())
+        "test_topic"
+        |> Channel.new(self())
         |> Channel.add_binding("postgres_changes", %{
           event: "INSERT",
           schema: "public",

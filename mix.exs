@@ -14,20 +14,24 @@ defmodule Supabase.Realtime.MixProject do
       docs: docs(),
       package: package(),
       description: description(),
+      elixirc_paths: elixirc_paths(Mix.env()),
       dialyzer: [plt_local_path: "priv/plts", ignore_warnings: ".dialyzerignore.exs"]
     ]
   end
 
+  defp elixirc_paths(e) when e in [:dev, :test], do: ["lib", "test/support.ex"]
+  defp elixirc_paths(_), do: ["lib"]
+
   def application do
-    [
-      extra_applications: [:logger],
-      mod: {Supabase.Realtime.Application, []}
-    ]
+    [extra_applications: [:logger] ++ if(Mix.env() == :dev, do: [:wx, :observer], else: [])]
   end
 
   defp deps do
     [
+      {:gun, "~> 2.1"},
       {:supabase_potion, "~> 0.6"},
+      {:mimic, "~> 1.1", only: :test},
+      {:styler, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, ">= 0.0.0", only: [:dev], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.3", only: [:dev, :test], runtime: false}

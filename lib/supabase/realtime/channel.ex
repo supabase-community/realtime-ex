@@ -13,7 +13,7 @@ defmodule Supabase.Realtime.Channel do
 
   Fields:
   * `topic` - The channel topic string
-  * `client` - The client process or module
+  * `registry` - The channel registry process or module
   * `bindings` - Event bindings for this channel
   * `state` - Current state of the channel
   * `join_ref` - Reference for the join message
@@ -23,7 +23,7 @@ defmodule Supabase.Realtime.Channel do
   """
   @type t :: %__MODULE__{
           topic: String.t(),
-          client: pid() | atom(),
+          registry: pid() | atom(),
           bindings: map(),
           state: Realtime.channel_state(),
           join_ref: Realtime.ref() | nil,
@@ -32,10 +32,10 @@ defmodule Supabase.Realtime.Channel do
           ref: String.t()
         }
 
-  @enforce_keys [:topic, :client]
+  @enforce_keys [:topic, :registry]
   defstruct [
     :topic,
-    :client,
+    :registry,
     :join_ref,
     :ref,
     bindings: %{},
@@ -56,7 +56,7 @@ defmodule Supabase.Realtime.Channel do
   ## Parameters
 
   * `topic` - The topic to subscribe to
-  * `client` - The client module or PID
+  * `registry` - The channel registry module or PID
   * `opts` - Additional options for the channel
 
   ## Options
@@ -70,7 +70,7 @@ defmodule Supabase.Realtime.Channel do
   * `%Channel{}` - A channel struct
   """
   @spec new(String.t(), pid() | atom(), keyword()) :: t()
-  def new(topic, client, opts \\ []) do
+  def new(topic, registry, opts \\ []) do
     topic = if String.starts_with?(topic, "realtime:"), do: topic, else: "realtime:#{topic}"
 
     params = opts[:params] || %{}
@@ -87,7 +87,7 @@ defmodule Supabase.Realtime.Channel do
 
     %__MODULE__{
       topic: topic,
-      client: client,
+      registry: registry,
       timeout: opts[:timeout] || 10_000,
       params: merged_params,
       ref: opts[:ref] || generate_ref()
@@ -107,8 +107,7 @@ defmodule Supabase.Realtime.Channel do
   * `%Channel{}` - Updated channel struct
   """
   @spec update_state(t(), Realtime.channel_state()) :: t()
-  def update_state(%__MODULE__{} = channel, state)
-      when state in [:closed, :errored, :joined, :joining, :leaving] do
+  def update_state(%__MODULE__{} = channel, state) when state in [:closed, :errored, :joined, :joining, :leaving] do
     %{channel | state: state}
   end
 
@@ -296,6 +295,6 @@ defmodule Supabase.Realtime.Channel do
   end
 
   defp generate_ref do
-    :crypto.strong_rand_bytes(16) |> Base.encode16(case: :lower)
+    "channel:" <> (16 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower))
   end
 end
