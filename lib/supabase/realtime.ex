@@ -254,6 +254,16 @@ defmodule Supabase.Realtime do
   @type ref :: String.t()
 
   @typedoc """
+  Acknowledgment reference type used for tracking broadcast acknowledgments.
+  """
+  @type ack_ref :: String.t()
+
+  @typedoc """
+  Acknowledgment response types.
+  """
+  @type ack_response :: {:ok, :acknowledged} | {:error, :timeout} | {:error, :not_supported}
+
+  @typedoc """
   Realtime message payload structure.
   """
   @type realtime_message :: %{
@@ -310,137 +320,8 @@ defmodule Supabase.Realtime do
 
       use Supervisor
 
-      @impl Supervisor
-      def init(opts) do
-        module = opts[:name] || __MODULE__
-        client = Keyword.fetch!(opts, :supabase_client)
-        heartbeat_interval = opts[:heartbeat_interval] || to_timeout(second: 30)
-        store_name = Module.concat(module, Store)
-        registry_name = Module.concat(module, Registry)
-        conn_name = Module.concat(module, Connection)
-        reconnect_after_ms = opts[:reconnect_after_ms]
-
-        children =
-          [
-            {Channel.Store, name: store_name},
-            {Channel.Registry, module: module, name: registry_name, store: store_name},
-            {Realtime.Connection,
-             name: conn_name,
-             registry: registry_name,
-             store: store_name,
-             client: client,
-             heartbeat_interval: heartbeat_interval,
-             reconnect_after_ms: reconnect_after_ms}
-          ]
-
-        Supervisor.init(children, strategy: :one_for_one)
-      end
-
-      @doc """
-      Check `Supabase.Realtime.channel/3` for more information.
-      """
-      def channel(topic, opts \\ []) do
-        with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
-          Realtime.channel(registry, topic, opts)
-        end
-      end
-
-      @doc """
-      Check `Supabase.Realtime.remove_all_channels/1` for more information.
-      """
-      def remove_all_channels do
-        with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
-          Realtime.remove_all_channels(registry)
-        end
-      end
-
-      @doc """
-      Check `Supabase.Realtime.connection_state/1` for more information.
-      """
-      def connection_state do
-        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
-          Realtime.connection_state(conn)
-        end
-      end
-
-      @doc """
-      Check `Supabase.Realtime.on/3` for more information.
-      """
-      defdelegate on(channel, type, filter), to: Realtime
-
-      @doc """
-      Check `Supabase.Realtime.send/2` for more information.
-      """
-      def send(channel, payload) do
-        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
-          Realtime.send(conn, channel, payload)
-        end
-      end
-
-      @doc """
-      Check `Supabase.Realtime.unsubscribe/1` for more information.
-      """
-      defdelegate unsubscribe(channel), to: Realtime
-
-      @doc """
-      Track presence state on a channel.
-
-      Allows tracking the current client's state so other clients can see it.
-      """
-      def track(channel, presence_state) do
-        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
-          Realtime.track(conn, channel, presence_state)
-        end
-      end
-
-      @doc """
-      Untrack presence state on a channel.
-
-      Removes the current client's state from the channel presence.
-      """
-      def untrack(channel) do
-        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
-          Realtime.untrack(conn, channel)
-        end
-      end
-
-      @doc """
-      Get the current presence state for a channel.
-
-      Returns a map of presence information from all clients.
-      """
-      def presence_state do
-        with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
-          GenServer.call(registry, :get_presence_state)
-        end
-      end
-
-      @doc """
-      Update the authentication token used for all channels.
-      """
-      def set_auth(token) when is_binary(token) do
-        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
-          Realtime.set_auth(conn, token)
-        end
-      end
-
-      @doc """
-      Update the authentication token for a specific channel.
-      """
-      def set_auth(channel, token) when is_binary(token) do
-        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
-          Realtime.set_auth(conn, channel, token)
-        end
-      end
-
-      @doc """
-      Send a broadcast message to a channel.
-      """
-      def broadcast(channel, event, payload) do
-        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
-          Realtime.broadcast(conn, channel, event, payload)
-        end
-      end
+      unquote(generate_supervisor_init())
+      unquote(generate_api_functions())
     end
   end
 
@@ -668,6 +549,74 @@ defmodule Supabase.Realtime do
   end
 
   @doc """
+  Sends a broadcast message to a channel with acknowledgment support.
+
+  This function sends a broadcast message and optionally returns an acknowledgment
+  reference if acknowledgments are enabled on the channel.
+
+  ## Parameters
+
+  * `conn` - The connection PID or name
+  * `channel` - The channel struct
+  * `event` - The event name
+  * `payload` - The message payload
+
+  ## Returns
+
+  * `{:ok, ack_ref}` - Successfully sent with acknowledgment enabled
+  * `:ok` - Successfully sent without acknowledgment
+  * `{:error, term()}` - Failed to send the broadcast
+  """
+  @spec broadcast_with_ack(pid() | module(), channel(), String.t(), map()) ::
+          {:ok, ack_ref()} | :ok | {:error, term()}
+  def broadcast_with_ack(conn, %Channel{} = channel, event, payload) when is_binary(event) and is_map(payload) do
+    with pid when is_pid(pid) <- ensure_pid(conn) do
+      if Channel.ack_enabled?(channel) do
+        ack_ref = generate_ack_ref()
+        message = Message.broadcast_message_with_ack(channel, event, payload, ack_ref)
+
+        with :ok <- Realtime.Connection.send_message_with_ack(pid, channel, message, ack_ref), do: {:ok, ack_ref}
+      else
+        message = Message.broadcast_message(channel, event, payload)
+        Realtime.Connection.send_message(pid, channel, message)
+      end
+    end
+  end
+
+  @doc """
+  Wait for an acknowledgment for a broadcast message.
+
+  This function blocks the calling process until an acknowledgment is received
+  or a timeout occurs.
+
+  ## Parameters
+
+  * `ack_ref` - The acknowledgment reference
+  * `opts` - Options including `:timeout` (default: 5000ms)
+
+  ## Returns
+
+  * `{:ok, :acknowledged}` - Message was acknowledged
+  * `{:error, :timeout}` - No acknowledgment received within timeout
+  * `{:error, :not_found}` - Acknowledgment reference not found
+  """
+  @spec wait_for_ack(ack_ref(), keyword()) :: ack_response()
+  def wait_for_ack(ack_ref, opts \\ []) when is_binary(ack_ref) do
+    timeout = Keyword.get(opts, :timeout, 5000)
+
+    receive do
+      {:ack_received, ^ack_ref} ->
+        {:ok, :acknowledged}
+
+      {:ack_timeout, ^ack_ref} ->
+        {:error, :timeout}
+    after
+      timeout ->
+        {:error, :timeout}
+    end
+  end
+
+  @doc """
   Removes all channel subscriptions.
 
   ## Parameters
@@ -729,8 +678,213 @@ defmodule Supabase.Realtime do
     end
   end
 
+  # Helper functions for macro generation
+
+  defp generate_supervisor_init do
+    quote do
+      @impl Supervisor
+      def init(opts) do
+        module = opts[:name] || __MODULE__
+        client = Keyword.fetch!(opts, :supabase_client)
+        heartbeat_interval = opts[:heartbeat_interval] || to_timeout(second: 30)
+        store_name = Module.concat(module, Store)
+        registry_name = Module.concat(module, Registry)
+        conn_name = Module.concat(module, Connection)
+        reconnect_after_ms = opts[:reconnect_after_ms]
+
+        children =
+          [
+            {Channel.Store, name: store_name},
+            {Channel.Registry, module: module, name: registry_name, store: store_name},
+            {Realtime.Connection,
+             name: conn_name,
+             registry: registry_name,
+             store: store_name,
+             client: client,
+             heartbeat_interval: heartbeat_interval,
+             reconnect_after_ms: reconnect_after_ms}
+          ]
+
+        Supervisor.init(children, strategy: :one_for_one)
+      end
+    end
+  end
+
+  defp generate_api_functions do
+    quote do
+      unquote(generate_basic_api_functions())
+      unquote(generate_presence_functions())
+      unquote(generate_auth_and_broadcast_functions())
+    end
+  end
+
+  defp generate_basic_api_functions do
+    quote do
+      @doc """
+      Check `Supabase.Realtime.channel/3` for more information.
+      """
+      def channel(topic, opts \\ []) do
+        with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
+          Realtime.channel(registry, topic, opts)
+        end
+      end
+
+      @doc """
+      Check `Supabase.Realtime.remove_all_channels/1` for more information.
+      """
+      def remove_all_channels do
+        with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
+          Realtime.remove_all_channels(registry)
+        end
+      end
+
+      @doc """
+      Check `Supabase.Realtime.connection_state/1` for more information.
+      """
+      def connection_state do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.connection_state(conn)
+        end
+      end
+
+      @doc """
+      Check `Supabase.Realtime.on/3` for more information.
+      """
+      defdelegate on(channel, type, filter), to: Realtime
+
+      @doc """
+      Check `Supabase.Realtime.send/2` for more information.
+      """
+      def send(channel, payload) do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.send(conn, channel, payload)
+        end
+      end
+
+      @doc """
+      Check `Supabase.Realtime.unsubscribe/1` for more information.
+      """
+      defdelegate unsubscribe(channel), to: Realtime
+    end
+  end
+
+  defp generate_presence_functions do
+    quote do
+      @doc """
+      Track presence state on a channel.
+
+      Allows tracking the current client's state so other clients can see it.
+      """
+      def track(channel, presence_state) do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.track(conn, channel, presence_state)
+        end
+      end
+
+      @doc """
+      Untrack presence state on a channel.
+
+      Removes the current client's state from the channel presence.
+      """
+      def untrack(channel) do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.untrack(conn, channel)
+        end
+      end
+
+      @doc """
+      Get the current presence state for a channel.
+
+      Returns a map of presence information from all clients.
+      """
+      def presence_state do
+        with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
+          GenServer.call(registry, :get_presence_state)
+        end
+      end
+    end
+  end
+
+  defp generate_auth_and_broadcast_functions do
+    quote do
+      @doc """
+      Update the authentication token used for all channels.
+      """
+      def set_auth(token) when is_binary(token) do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.set_auth(conn, token)
+        end
+      end
+
+      @doc """
+      Update the authentication token for a specific channel.
+      """
+      def set_auth(channel, token) when is_binary(token) do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.set_auth(conn, channel, token)
+        end
+      end
+
+      @doc """
+      Send a broadcast message to a channel.
+      """
+      def broadcast(channel, event, payload) do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.broadcast(conn, channel, event, payload)
+        end
+      end
+
+      @doc """
+      Send a broadcast message to a channel with acknowledgment support.
+
+      If acknowledgments are enabled on the channel, returns an acknowledgment reference
+      that can be used with `wait_for_ack/2` to wait for delivery confirmation.
+
+      ## Parameters
+
+      * `channel` - The channel struct
+      * `event` - The event name
+      * `payload` - The message payload
+
+      ## Returns
+
+      * `{:ok, ack_ref}` - When acknowledgments are enabled
+      * `:ok` - When acknowledgments are disabled
+      * `{:error, term()}` - When an error occurs
+      """
+      def broadcast_with_ack(channel, event, payload) do
+        with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do
+          Realtime.broadcast_with_ack(conn, channel, event, payload)
+        end
+      end
+
+      @doc """
+      Wait for an acknowledgment for a broadcast message.
+
+      ## Parameters
+
+      * `ack_ref` - The acknowledgment reference returned by `broadcast_with_ack/3`
+      * `opts` - Options including `:timeout` (default: 5000ms)
+
+      ## Returns
+
+      * `{:ok, :acknowledged}` - Message was acknowledged
+      * `{:error, :timeout}` - No acknowledgment received within timeout
+      * `{:error, :not_supported}` - Channel doesn't support acknowledgments
+      """
+      def wait_for_ack(ack_ref, opts \\ []) do
+        Realtime.wait_for_ack(ack_ref, opts)
+      end
+    end
+  end
+
   # Helper function to ensure we have a PID
   defp ensure_pid(client) when is_pid(client), do: client
   defp ensure_pid(client) when is_atom(client), do: Process.whereis(client)
   defp ensure_pid(_), do: {:error, :invalid_client}
+
+  # Helper function to generate acknowledgment references
+  defp generate_ack_ref do
+    "ack:" <> (16 |> :crypto.strong_rand_bytes() |> Base.encode16(case: :lower))
+  end
 end

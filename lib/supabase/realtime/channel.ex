@@ -20,6 +20,7 @@ defmodule Supabase.Realtime.Channel do
   * `timeout` - Timeout for operations in milliseconds
   * `params` - Additional parameters for the channel
   * `ref` - Unique reference for this channel
+  * `pending_acks` - Map of pending acknowledgment references and their details
   """
   @type t :: %__MODULE__{
           topic: String.t(),
@@ -29,7 +30,8 @@ defmodule Supabase.Realtime.Channel do
           join_ref: Realtime.ref() | nil,
           timeout: pos_integer(),
           params: map(),
-          ref: String.t()
+          ref: String.t(),
+          pending_acks: map()
         }
 
   @enforce_keys [:topic, :registry]
@@ -47,7 +49,8 @@ defmodule Supabase.Realtime.Channel do
         presence: %{key: ""},
         private: false
       }
-    }
+    },
+    pending_acks: %{}
   ]
 
   @doc """
@@ -283,6 +286,89 @@ defmodule Supabase.Realtime.Channel do
   @spec can_push?(t()) :: boolean()
   def can_push?(%__MODULE__{state: :joined}), do: true
   def can_push?(_), do: false
+
+  @doc """
+  Adds a pending acknowledgment to the channel.
+
+  ## Parameters
+
+  * `channel` - The channel struct
+  * `ack_ref` - The acknowledgment reference
+  * `caller` - The process that will receive the acknowledgment
+
+  ## Returns
+
+  * `%Channel{}` - Updated channel struct
+  """
+  @spec add_pending_ack(t(), String.t(), pid()) :: t()
+  def add_pending_ack(%__MODULE__{} = channel, ack_ref, caller) do
+    ack_info = %{
+      caller: caller,
+      timer: Process.send_after(self(), {:ack_timeout, ack_ref}, channel.timeout)
+    }
+
+    %{channel | pending_acks: Map.put(channel.pending_acks, ack_ref, ack_info)}
+  end
+
+  @doc """
+  Removes a pending acknowledgment from the channel.
+
+  ## Parameters
+
+  * `channel` - The channel struct
+  * `ack_ref` - The acknowledgment reference
+
+  ## Returns
+
+  * `%Channel{}` - Updated channel struct
+  """
+  @spec remove_pending_ack(t(), String.t()) :: t()
+  def remove_pending_ack(%__MODULE__{} = channel, ack_ref) do
+    case Map.get(channel.pending_acks, ack_ref) do
+      %{timer: timer} when timer != nil ->
+        Process.cancel_timer(timer)
+        %{channel | pending_acks: Map.delete(channel.pending_acks, ack_ref)}
+
+      _ ->
+        %{channel | pending_acks: Map.delete(channel.pending_acks, ack_ref)}
+    end
+  end
+
+  @doc """
+  Gets the caller process for a pending acknowledgment.
+
+  ## Parameters
+
+  * `channel` - The channel struct
+  * `ack_ref` - The acknowledgment reference
+
+  ## Returns
+
+  * `{:ok, pid()}` - The caller process
+  * `:error` - Acknowledgment not found
+  """
+  @spec get_ack_caller(t(), String.t()) :: {:ok, pid()} | :error
+  def get_ack_caller(%__MODULE__{} = channel, ack_ref) do
+    case Map.get(channel.pending_acks, ack_ref) do
+      %{caller: caller} -> {:ok, caller}
+      _ -> :error
+    end
+  end
+
+  @doc """
+  Checks if acknowledgments are enabled for this channel.
+
+  ## Parameters
+
+  * `channel` - The channel struct
+
+  ## Returns
+
+  * `boolean` - True if acknowledgments are enabled, false otherwise
+  """
+  @spec ack_enabled?(t()) :: boolean()
+  def ack_enabled?(%__MODULE__{params: %{config: %{broadcast: %{ack: ack}}}}), do: ack
+  def ack_enabled?(_), do: false
 
   # Private helper functions
 

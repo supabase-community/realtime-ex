@@ -121,6 +121,34 @@ defmodule Supabase.Realtime.Message do
   end
 
   @doc """
+  Constructs a broadcast message with acknowledgment support.
+
+  ## Parameters
+
+  * `channel` - The channel struct
+  * `event` - The event name
+  * `payload` - The message payload
+  * `ack_ref` - The acknowledgment reference
+
+  ## Returns
+
+  * `map` - Broadcast message payload with acknowledgment reference
+  """
+  @spec broadcast_message_with_ack(Channel.t(), String.t(), map(), String.t()) :: map()
+  def broadcast_message_with_ack(%Channel{} = channel, event, payload, ack_ref) do
+    %{
+      topic: channel.topic,
+      event: "broadcast",
+      payload: %{
+        type: "broadcast",
+        event: event,
+        payload: payload
+      },
+      ack_ref: ack_ref
+    }
+  end
+
+  @doc """
   Constructs an access token update message.
 
   ## Parameters

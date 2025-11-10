@@ -75,6 +75,21 @@ defmodule Supabase.Realtime.Connection do
   end
 
   @doc """
+  Sends a message on a channel with acknowledgment support.
+
+  ## Parameters
+
+  * `server` - The server PID or name
+  * `channel` - The channel struct
+  * `payload` - The message payload
+  * `ack_ref` - The acknowledgment reference
+  """
+  @spec send_message_with_ack(GenServer.server(), Channel.t(), map(), String.t()) :: :ok | {:error, term()}
+  def send_message_with_ack(server, %Channel{} = channel, payload, ack_ref) do
+    GenServer.call(server, {:send_message_with_ack, channel, payload, ack_ref})
+  end
+
+  @doc """
   Updates the authentication token for all channels.
 
   ## Parameters
@@ -168,6 +183,22 @@ defmodule Supabase.Realtime.Connection do
 
   def handle_call({:send_message, channel, payload}, _from, state) do
     :ok = send_message_to_topic(channel, payload, state)
+
+    {:reply, :ok, state}
+  end
+
+  def handle_call({:send_message_with_ack, channel, _payload, _ack_ref}, _from, %{status: status, socket: nil} = state)
+      when status != :open do
+    Logger.warning("[#{inspect(__MODULE__)}]: Not connected, ignoring ack message for channel: #{inspect(channel)}")
+
+    {:reply, {:error, :not_connected}, state}
+  end
+
+  def handle_call({:send_message_with_ack, channel, payload, ack_ref}, {caller, _tag}, state) do
+    # Update channel to track this acknowledgment
+    {:ok, updated_channel} = Store.add_pending_ack(state.store, channel, ack_ref, caller)
+
+    :ok = send_message_to_topic(updated_channel, payload, state)
 
     {:reply, :ok, state}
   end
@@ -276,6 +307,22 @@ defmodule Supabase.Realtime.Connection do
   end
 
   @impl true
+  def handle_info({:ack_timeout, ack_ref}, state) do
+    Logger.debug("[#{__MODULE__}]: Acknowledgment timeout for: #{ack_ref}")
+
+    case Store.handle_ack_timeout(state.store, ack_ref) do
+      {:ok, caller} ->
+        send(caller, {:ack_timeout, ack_ref})
+        Logger.debug("[#{__MODULE__}]: Sent ack timeout notification to #{inspect(caller)}")
+
+      :error ->
+        Logger.warning("[#{__MODULE__}]: Timeout for unknown ack reference: #{ack_ref}")
+    end
+
+    {:noreply, state}
+  end
+
+  @impl true
   def terminate(_reason, state) do
     if state.status == :open and !!state.socket do
       :gun.close(state.socket)
@@ -354,6 +401,23 @@ defmodule Supabase.Realtime.Connection do
        ) do
     Logger.debug("[#{__MODULE__}]: Received heartbeat reply")
     {:noreply, %{state | pending_heartbeat_ref: nil}}
+  end
+
+  defp handle_ws_message(%{"event" => "phx_reply", "payload" => %{"status" => "ok"}, "ref" => ack_ref}, state)
+       when is_binary(ack_ref) and binary_part(ack_ref, 0, 4) == "ack:" do
+    Logger.debug("[#{__MODULE__}]: Received acknowledgment reply: #{ack_ref}")
+
+    # Find the channel and notify the caller
+    case Store.handle_ack_received(state.store, ack_ref) do
+      {:ok, caller} ->
+        send(caller, {:ack_received, ack_ref})
+        Logger.debug("[#{__MODULE__}]: Sent ack notification to #{inspect(caller)}")
+
+      :error ->
+        Logger.warning("[#{__MODULE__}]: Received ack for unknown reference: #{ack_ref}")
+    end
+
+    {:noreply, state}
   end
 
   defp handle_ws_message(message, state) do
