@@ -7,7 +7,7 @@ All notable changes to this project are documented in this file.
 
 ### Features
 
-* **phase-1:** reliability ([#30](https://github.com/supabase-community/realtime-ex/issues/30)) ([5549e08](https://github.com/supabase-community/realtime-ex/commit/5549e0842efb7b788839deef4cb29d78acb3334c))
+* Message buffering and server binding validation ([#30](https://github.com/supabase-community/realtime-ex/issues/30)) ([5549e08](https://github.com/supabase-community/realtime-ex/commit/5549e0842efb7b788839deef4cb29d78acb3334c))
 
 ## [0.2.0](https://github.com/supabase-community/realtime-ex/compare/v0.1.0...v0.2.0) (2025-11-10)
 
