@@ -1,116 +1,98 @@
 defmodule Supabase.Realtime do
   @moduledoc """
-  Client for interacting with Supabase Realtime service.
+  Client for Supabase Realtime.
 
-  This module provides a behavior for implementing Realtime clients that connect
-  to Supabase's Realtime service. It enables applications to subscribe to
-  database changes, broadcast messages, and maintain presence information.
-
-  The Realtime client establishes and maintains a WebSocket connection to the
-  Supabase Realtime service, handles reconnection with exponential backoff,
-  and processes subscription events through a channel-based architecture.
+  This module provides a behavior for building Realtime clients that connect
+  to Supabase Realtime. It supports database change subscriptions, broadcast
+  messages, and presence tracking.
 
   ## Core Architecture
 
-  The client consists of three main components:
+  The client has three main components:
 
-  1. **Connection** - Handles WebSocket connection management, heartbeats,
-     reconnection logic, and message transmission.
-  2. **Channel Registry** - Manages subscriptions, routes incoming messages
-     to appropriate handlers, and tracks channel states.
-  3. **Channel Store** - Stores subscription data in an ETS table for efficient
-     lookup and persistence across the application.
+  1. **Connection** - WebSocket management, heartbeats, reconnection with
+     exponential backoff, send/push buffers, and HTTP fallback for broadcasts.
+  2. **Channel Registry** - Routes messages to handlers, tracks channel states,
+     supports wildcard event matching.
+  3. **Channel Store** - ETS-based storage for channel data.
 
   ## Installation
 
-  Add `supabase_realtime` to your list of dependencies in `mix.exs`:
+  Add `supabase_realtime` to your dependencies in `mix.exs`:
 
-  ```elixir
-  def deps do
-    [
-      {:supabase_realtime, "~> 0.1.0"}
-    ]
-  end
-  ```
+      def deps do
+        [
+          {:supabase_realtime, "~> 0.4.0"}
+        ]
+      end
 
-  ## Configuration
+  ## Quick Start
 
-  Configure the client in your application:
+  First, create a Supabase client with `Supabase.init_client/3`:
 
-  ```elixir
-  # In your application config
-  config :my_app, MyApp.Supabase,
-    api_key: System.get_env("SUPABASE_API_KEY"),
-    project_ref: System.get_env("SUPABASE_PROJECT_REF")
-  ```
+      {:ok, client} = Supabase.init_client(
+        "https://your-project.supabase.co",
+        "your-api-key"
+      )
 
-  ## Usage
-
-  Define a module that uses `Supabase.Realtime`:
+  Then define a module that uses `Supabase.Realtime`:
 
       defmodule MyApp.Realtime do
         use Supabase.Realtime
 
-        def start_link(opts \\ []) do
+        def start_link(opts \\\\ []) do
           Supabase.Realtime.start_link(__MODULE__, opts)
         end
 
         @impl true
         def handle_event({:postgres_changes, :insert, payload}) do
-          # Handle INSERT events
-          IO.inspect(payload, label: "New record inserted")
+          IO.inspect(payload, label: "New record")
           :ok
         end
 
         @impl true
-        def handle_event({:postgres_changes, :update, payload}) do
-          # Handle UPDATE events
-          IO.inspect(payload, label: "Record updated")
+        def handle_event({:broadcast, event_name, payload}) do
+          IO.inspect(payload, label: "Broadcast")
           :ok
         end
 
         @impl true
-        def handle_event({:postgres_changes, :delete, payload}) do
-          # Handle DELETE events
-          IO.inspect(payload, label: "Record deleted")
-          :ok
-        end
-
-        @impl true
-        def handle_event({:broadcast, event_type, payload}) do
-          # Handle broadcast events
-          IO.inspect(payload, label: "Broadcast event")
+        def handle_event({:presence, event, payload}) do
+          IO.inspect(payload, label: "Presence")
           :ok
         end
       end
 
   Add it to your supervision tree:
 
+      {:ok, client} = Supabase.init_client(
+        System.fetch_env!("SUPABASE_URL"),
+        System.fetch_env!("SUPABASE_KEY")
+      )
+
       children = [
-        {MyApp.Supabase, []},
-        {MyApp.Realtime, supabase_client: MyApp.Supabase}
+        {MyApp.Realtime, client: client}
       ]
 
-  Subscribe to database changes:
+  ## Subscribing to Database Changes
 
-      # Create a channel
       {:ok, channel} = MyApp.Realtime.channel("public:users")
-      
-      # Subscribe to INSERT events on the users table
+
+      # Listen to INSERT events on the users table
       :ok = MyApp.Realtime.on(channel, "postgres_changes",
         event: :insert,
         schema: "public",
         table: "users"
       )
-      
-      # Subscribe to all events on the users table
+
+      # Listen to all events on the users table
       :ok = MyApp.Realtime.on(channel, "postgres_changes",
         event: :all,
         schema: "public",
         table: "users"
       )
-      
-      # Subscribe with a filter
+
+      # Listen with a filter
       :ok = MyApp.Realtime.on(channel, "postgres_changes",
         event: :update,
         schema: "public",
@@ -118,45 +100,64 @@ defmodule Supabase.Realtime do
         filter: "id=eq.1"
       )
 
-  Send broadcast messages:
+  ## Broadcast Messages
 
       :ok = MyApp.Realtime.send(channel, %{
         type: "broadcast",
         event: "new_message",
-        payload: %{text: "Hello, world!"}
+        payload: %{text: "Hello!"}
       })
 
-  Unsubscribe from a channel:
+  ## Wildcard Events
+
+  Use `event: :all` or `event: "*"` to listen to all broadcast events
+  on a channel:
+
+      :ok = MyApp.Realtime.on(channel, "broadcast", event: "*")
+
+  ## Unsubscribe
 
       :ok = MyApp.Realtime.unsubscribe(channel)
-
-  Remove all subscriptions:
-
       :ok = MyApp.Realtime.remove_all_channels()
 
-  ## Advanced Configuration
+  ## Options
 
-  The client supports additional configuration options:
+  These options can be passed to `start_link/2`:
 
-  ```elixir
-  # Start with custom options
-  {:ok, _pid} = MyApp.Realtime.start_link([
-    supabase_client: MyApp.Supabase,
-    heartbeat_interval: :timer.seconds(15),
-    reconnect_after_ms: fn tries -> :timer.seconds(tries) end
-  ])
-  ```
+  * `:client` (required) - A `%Supabase.Client{}` struct from `Supabase.init_client/3`.
+  * `:name` - Process registration name.
+  * `:timeout` - Connection timeout in milliseconds (default: 10000).
+  * `:heartbeat_interval` - Milliseconds between heartbeats (default: 30000).
+  * `:reconnect_after_ms` - A function that receives the attempt count and returns
+    a delay in milliseconds. Defaults to exponential backoff.
+  * `:http_fallback` - When `true`, broadcast messages are sent over HTTP
+    if the WebSocket connection is down (default: false).
+  * `:access_token_fn` - A zero-arity function or `{mod, fun, args}` tuple
+    that returns `{:ok, token}` or `{:error, reason}`. Used to refresh tokens
+    before each connection attempt.
+  * `:params` - A map of extra query params appended to the WebSocket URL.
+
+  ### Example with all options
+
+      {:ok, _pid} = MyApp.Realtime.start_link(
+        client: client,
+        heartbeat_interval: :timer.seconds(15),
+        reconnect_after_ms: fn tries -> min(:timer.seconds(10), :timer.seconds(tries)) end,
+        http_fallback: true,
+        access_token_fn: fn -> MyApp.Auth.get_token() end,
+        params: %{log_level: "debug"}
+      )
 
   ## Event Handling
 
-  The `handle_event/1` callback receives all events matching your subscriptions.
-  The function must return `:ok` to acknowledge successful processing.
+  The `handle_event/1` callback receives events matching your subscriptions.
+  It must return `:ok`.
 
-  Event payloads follow this pattern:
+  Event shapes:
 
-  1. Database Changes: `{:postgres_changes, operation, payload}`
-  2. Broadcast Messages: `{:broadcast, event_name, payload}`
-  3. Presence Updates: `{:presence, presence_event, payload}`
+  * Database changes: `{:postgres_changes, operation, payload}`
+  * Broadcast messages: `{:broadcast, event_name, payload}`
+  * Presence updates: `{:presence, event, payload}`
   """
 
   alias Supabase.Realtime
@@ -204,13 +205,13 @@ defmodule Supabase.Realtime do
   """
   @type realtime_listen_type :: :broadcast | :presence | :postgres_changes | :system
 
-  @type client :: module() | atom()
+  @type client :: Supabase.Client.t()
   @type t :: pid() | atom()
   @type channel :: Channel.t()
   @type event_type :: :postgres_changes | :broadcast | :presence
   @type event_filter :: Enumerable.t()
   @type channel_opts :: keyword()
-  @type start_option :: {:name, atom()} | {:supabase_client, client()} | {:timeout, pos_integer()}
+  @type start_option :: {:name, atom()} | {:client, Supabase.Client.t()} | {:timeout, pos_integer()}
   @typedoc """
   Types of PostgreSQL database changes.
 
@@ -330,11 +331,14 @@ defmodule Supabase.Realtime do
 
   ## Options
 
-  * `:name` - Registers the process with the given name
-  * `:supabase_client` - The Supabase client to use for configuration
-  * `:timeout` - Connection timeout in milliseconds (default: 10000)
-  * `:heartbeat_interval` - Interval in milliseconds between heartbeats (default: 30s)
-  * `:reconnect_after_ms` - Function that returns reconnection delay based on attempts
+  * `:client` (required) - A `%Supabase.Client{}` struct from `Supabase.init_client/3`.
+  * `:name` - Registers the process with the given name.
+  * `:timeout` - Connection timeout in milliseconds (default: 10000).
+  * `:heartbeat_interval` - Milliseconds between heartbeats (default: 30000).
+  * `:reconnect_after_ms` - Function that receives attempt count and returns delay in ms.
+  * `:http_fallback` - Send broadcasts over HTTP when WebSocket is down (default: false).
+  * `:access_token_fn` - Zero-arity function returning `{:ok, token}` for token refresh.
+  * `:params` - Map of extra query params for the WebSocket URL.
   """
   @spec start_link(module(), [start_option()]) :: Supervisor.on_start()
   def start_link(module, opts \\ []) do
@@ -689,7 +693,7 @@ defmodule Supabase.Realtime do
       @impl Supervisor
       def init(opts) do
         module = opts[:name] || __MODULE__
-        client = Keyword.fetch!(opts, :supabase_client)
+        client = Keyword.fetch!(opts, :client)
         heartbeat_interval = opts[:heartbeat_interval] || to_timeout(second: 30)
         store_name = Module.concat(module, Store)
         registry_name = Module.concat(module, Registry)

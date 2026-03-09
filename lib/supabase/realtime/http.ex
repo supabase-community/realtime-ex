@@ -2,8 +2,24 @@ defmodule Supabase.Realtime.HTTP do
   @moduledoc """
   HTTP fallback for Supabase Realtime broadcasts.
 
-  When the WebSocket connection is unavailable, this module provides
-  an HTTP POST fallback to deliver broadcast messages via the REST API.
+  Sends broadcast messages through the Supabase REST API when the WebSocket
+  connection is not available.
+
+  ## When Does the Fallback Trigger?
+
+  All three conditions must be true:
+
+  1. The WebSocket connection status is not `:open`.
+  2. The `:http_fallback` option is set to `true` on the connection.
+  3. The message being sent is a broadcast message.
+
+  Other message types (presence, postgres_changes) are never sent over HTTP.
+  They go into the send buffer and wait for the WebSocket to reconnect.
+
+  ## Example
+
+      # Usually called by the Connection module, but can be used directly:
+      Supabase.Realtime.HTTP.broadcast(client, token, "realtime:room:lobby", "new_msg", %{body: "hi"})
   """
 
   alias Supabase.Fetcher
@@ -24,7 +40,7 @@ defmodule Supabase.Realtime.HTTP do
   """
   @spec broadcast(Supabase.Client.t(), String.t(), String.t(), String.t(), map()) ::
           :ok | {:error, term()}
-  def broadcast(client, token, topic, event, payload) do
+  def broadcast(%Supabase.Client{} = client, token, topic, event, payload) do
     body = %{
       messages: [
         %{topic: topic, event: event, payload: payload}
