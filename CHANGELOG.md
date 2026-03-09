@@ -2,6 +2,13 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.1](https://github.com/supabase-community/realtime-ex/compare/v0.4.0...v0.4.1) (2026-03-09)
+
+
+### Miscellaneous Chores
+
+* remove readme warning ([d0ccebd](https://github.com/supabase-community/realtime-ex/commit/d0ccebdf823a69a2fe57f6c8d783385da3305f9a))
+
 ## [0.4.0](https://github.com/supabase-community/realtime-ex/compare/v0.3.0...v0.4.0) (2026-03-09)
 
 
