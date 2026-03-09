@@ -8,7 +8,7 @@ Add `supabase_realtime` and `supabase_potion` to your `mix.exs`:
 def deps do
   [
     {:supabase_potion, "~> 0.7"},
-    {:supabase_realtime, "~> 0.4.0"} # x-release-please-version
+    {:supabase_realtime, "~> 0.4.1"} # x-release-please-version
   ]
 end
 ```
