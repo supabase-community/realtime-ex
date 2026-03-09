@@ -23,7 +23,8 @@ defmodule Supabase.Realtime.Channel.Registry do
           module: module(),
           pending_events: list(),
           presence_state: map(),
-          store: pid() | module()
+          store: pid() | module(),
+          connection: pid() | module() | nil
         }
 
   # Client API
@@ -43,8 +44,9 @@ defmodule Supabase.Realtime.Channel.Registry do
     name = opts[:name] || __MODULE__
     module = Keyword.fetch!(opts, :module)
     store = Keyword.fetch!(opts, :store)
+    connection = opts[:connection]
 
-    GenServer.start_link(__MODULE__, %{module: module, store: store}, name: name)
+    GenServer.start_link(__MODULE__, %{module: module, store: store, connection: connection}, name: name)
   end
 
   @doc """
@@ -123,6 +125,7 @@ defmodule Supabase.Realtime.Channel.Registry do
     state = %{
       module: init_arg.module,
       store: init_arg.store,
+      connection: init_arg[:connection],
       pending_events: [],
       presence_state: %{}
     }
@@ -249,11 +252,12 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   defp handle_reply(%{"ref" => join_ref} = msg, state) do
-    %{"payload" => %{"status" => status}} = msg
+    %{"payload" => %{"status" => status} = payload} = msg
 
     case Store.find_by_join_ref(state.store, join_ref) do
       {:ok, channel} ->
         handle_channel_reply(channel, status, state)
+        maybe_update_binding_ids(channel, payload, state)
 
       {:error, :not_found} ->
         Logger.debug("Channel not found for reply message with ref #{join_ref}")
@@ -265,6 +269,10 @@ defmodule Supabase.Realtime.Channel.Registry do
   defp handle_channel_reply(channel, "ok", state) do
     Logger.debug("[#{channel.topic}] Successfully joined #{channel.ref}")
     Store.update_state(state.store, channel, :joined)
+
+    if state.connection do
+      GenServer.cast(state.connection, {:channel_joined, channel.topic})
+    end
   end
 
   defp handle_channel_reply(channel, status, state) when status in ~w(error timeout) do
@@ -278,7 +286,8 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   defp handle_event(channels, event, payload, state) when is_database_event(event) do
     db_event_type = event |> String.downcase() |> String.to_atom()
-    dispatch_event(state, channels, {:postgres_changes, db_event_type, payload})
+    matching = filter_by_server_ids(channels, payload)
+    dispatch_event(state, matching, {:postgres_changes, db_event_type, payload})
     {:noreply, state}
   end
 
@@ -323,6 +332,41 @@ defmodule Supabase.Realtime.Channel.Registry do
     dispatch_event(state, channels, {:broadcast, event, payload})
     {:noreply, state}
   end
+
+  defp filter_by_server_ids(channels, payload) do
+    case get_in(payload, ["ids"]) do
+      nil -> channels
+      [] -> channels
+      server_ids -> Enum.filter(channels, &channel_matches_ids?(&1, server_ids))
+    end
+  end
+
+  defp channel_matches_ids?(channel, server_ids) do
+    bindings = Map.get(channel.bindings, "postgres_changes", [])
+    bindings == [] or Enum.any?(bindings, fn b -> b.id in server_ids end)
+  end
+
+  defp maybe_update_binding_ids(channel, %{"response" => %{"postgres_changes" => server_bindings}}, state)
+       when is_list(server_bindings) do
+    client_bindings = Map.get(channel.bindings, "postgres_changes", [])
+    client_bindings_reversed = Enum.reverse(client_bindings)
+
+    updated_bindings =
+      client_bindings_reversed
+      |> Enum.with_index()
+      |> Enum.map(fn {binding, idx} ->
+        case Enum.at(server_bindings, idx) do
+          %{"id" => id} -> %{binding | id: id}
+          _ -> binding
+        end
+      end)
+      |> Enum.reverse()
+
+    updated_channel = %{channel | bindings: Map.put(channel.bindings, "postgres_changes", updated_bindings)}
+    Store.update(state.store, updated_channel)
+  end
+
+  defp maybe_update_binding_ids(_channel, _payload, _state), do: :ok
 
   # Helper to dispatch events to the callback module if available
   defp dispatch_event(state, channels, event) do

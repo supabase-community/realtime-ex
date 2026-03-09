@@ -18,6 +18,8 @@ defmodule Supabase.Realtime.Connection do
 
   require Logger
 
+  @max_send_buffer 100
+
   @typedoc """
   Connection state.
   """
@@ -34,7 +36,10 @@ defmodule Supabase.Realtime.Connection do
           heartbeat_interval: pos_integer(),
           pending_heartbeat_ref: Realtime.ref() | nil,
           reconnect_attempts: non_neg_integer(),
-          reconnect_after_ms: (non_neg_integer() -> pos_integer())
+          reconnect_after_ms: (non_neg_integer() -> pos_integer()),
+          send_buffer: :queue.queue(),
+          send_buffer_size: non_neg_integer(),
+          push_buffers: %{String.t() => :queue.queue()}
         }
 
   # Client API
@@ -134,7 +139,10 @@ defmodule Supabase.Realtime.Connection do
       heartbeat_interval: heartbeat_interval,
       pending_heartbeat_ref: nil,
       reconnect_attempts: 0,
-      reconnect_after_ms: reconnect_function
+      reconnect_after_ms: reconnect_function,
+      send_buffer: :queue.new(),
+      send_buffer_size: 0,
+      push_buffers: %{}
     }
 
     {:ok, state, {:continue, :connect}}
@@ -175,31 +183,27 @@ defmodule Supabase.Realtime.Connection do
   @impl true
   def handle_call(:state, _from, state), do: {:reply, state.status, state}
 
-  def handle_call({:send_message, channel, _}, _from, %{status: status, socket: nil} = state) when status != :open do
-    Logger.warning("[#{inspect(__MODULE__)}]: Not connected, ignoring message for channel: #{inspect(channel)}")
-
-    {:reply, {:error, :not_connected}, state}
-  end
-
-  def handle_call({:send_message, channel, payload}, _from, state) do
-    :ok = send_message_to_topic(channel, payload, state)
-
+  def handle_call({:send_message, channel, payload}, _from, %{status: status} = state) when status != :open do
+    Logger.debug("[#{inspect(__MODULE__)}]: Buffering message for channel: #{channel.topic}")
+    state = enqueue_send_buffer(state, channel, payload)
     {:reply, :ok, state}
   end
 
-  def handle_call({:send_message_with_ack, channel, _payload, _ack_ref}, _from, %{status: status, socket: nil} = state)
-      when status != :open do
-    Logger.warning("[#{inspect(__MODULE__)}]: Not connected, ignoring ack message for channel: #{inspect(channel)}")
+  def handle_call({:send_message, channel, payload}, _from, state) do
+    state = maybe_push_buffer_or_send(channel, payload, state)
+    {:reply, :ok, state}
+  end
 
-    {:reply, {:error, :not_connected}, state}
+  def handle_call({:send_message_with_ack, channel, payload, _ack_ref}, _from, %{status: status} = state)
+      when status != :open do
+    Logger.debug("[#{inspect(__MODULE__)}]: Buffering ack message for channel: #{channel.topic}")
+    state = enqueue_send_buffer(state, channel, payload)
+    {:reply, :ok, state}
   end
 
   def handle_call({:send_message_with_ack, channel, payload, ack_ref}, {caller, _tag}, state) do
-    # Update channel to track this acknowledgment
     {:ok, updated_channel} = Store.add_pending_ack(state.store, channel, ack_ref, caller)
-
-    :ok = send_message_to_topic(updated_channel, payload, state)
-
+    state = maybe_push_buffer_or_send(updated_channel, payload, state)
     {:reply, :ok, state}
   end
 
@@ -245,7 +249,7 @@ defmodule Supabase.Realtime.Connection do
 
   def handle_info({:gun_upgrade, socket, stream, ["websocket"], _headers}, %{socket: socket, stream_ref: stream} = state) do
     Logger.debug("[#{__MODULE__}]: Connection upgraded to websocket with success")
-    {:noreply, %{state | status: :open}}
+    {:noreply, flush_send_buffer(%{state | status: :open})}
   end
 
   def handle_info({:gun_down, socket, _protocol, reason, _killed_streams}, %{socket: socket} = state) do
@@ -291,7 +295,6 @@ defmodule Supabase.Realtime.Connection do
     {:noreply, %{state | heartbeat_timer: heartbeat_timer, pending_heartbeat_ref: heartbeat_ref}}
   end
 
-  @impl true
   def handle_info(:reconnect, state) do
     case connect(%{state | reconnect_attempts: state.reconnect_attempts + 1}) do
       {:ok, socket, updated_state} ->
@@ -306,7 +309,6 @@ defmodule Supabase.Realtime.Connection do
     end
   end
 
-  @impl true
   def handle_info({:ack_timeout, ack_ref}, state) do
     Logger.debug("[#{__MODULE__}]: Acknowledgment timeout for: #{ack_ref}")
 
@@ -323,6 +325,11 @@ defmodule Supabase.Realtime.Connection do
   end
 
   @impl true
+  def handle_cast({:channel_joined, topic}, state) do
+    {:noreply, flush_push_buffer(state, topic)}
+  end
+
+  @impl true
   def terminate(_reason, state) do
     if state.status == :open and !!state.socket do
       :gun.close(state.socket)
@@ -332,6 +339,63 @@ defmodule Supabase.Realtime.Connection do
     if state.reconnect_timer, do: Process.cancel_timer(state.reconnect_timer)
 
     :ok
+  end
+
+  # Buffer helpers
+
+  defp enqueue_send_buffer(state, channel, payload) do
+    {buffer, size} =
+      if state.send_buffer_size >= @max_send_buffer do
+        {_, q} = :queue.out(state.send_buffer)
+        {q, state.send_buffer_size}
+      else
+        {state.send_buffer, state.send_buffer_size + 1}
+      end
+
+    %{state | send_buffer: :queue.in({channel, payload}, buffer), send_buffer_size: size}
+  end
+
+  defp flush_send_buffer(state) do
+    state.send_buffer
+    |> :queue.to_list()
+    |> Enum.each(fn {channel, payload} ->
+      send_message_to_topic(channel, payload, state)
+    end)
+
+    %{state | send_buffer: :queue.new(), send_buffer_size: 0}
+  end
+
+  defp enqueue_push_buffer(state, topic, channel, payload) do
+    queue = Map.get(state.push_buffers, topic, :queue.new())
+    updated = :queue.in({channel, payload}, queue)
+    %{state | push_buffers: Map.put(state.push_buffers, topic, updated)}
+  end
+
+  defp flush_push_buffer(state, topic) do
+    case Map.pop(state.push_buffers, topic) do
+      {nil, _} ->
+        state
+
+      {queue, rest} ->
+        queue
+        |> :queue.to_list()
+        |> Enum.each(fn {channel, payload} ->
+          send_message_to_topic(channel, payload, state)
+        end)
+
+        %{state | push_buffers: rest}
+    end
+  end
+
+  defp maybe_push_buffer_or_send(channel, payload, state) do
+    case Store.find_by_ref(state.store, channel.ref) do
+      {:ok, latest} when latest.state == :joining ->
+        enqueue_push_buffer(state, channel.topic, channel, payload)
+
+      _ ->
+        send_message_to_topic(channel, payload, state)
+        state
+    end
   end
 
   # Private helper functions

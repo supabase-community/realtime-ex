@@ -571,15 +571,19 @@ defmodule Supabase.Realtime do
           {:ok, ack_ref()} | :ok | {:error, term()}
   def broadcast_with_ack(conn, %Channel{} = channel, event, payload) when is_binary(event) and is_map(payload) do
     with pid when is_pid(pid) <- ensure_pid(conn) do
-      if Channel.ack_enabled?(channel) do
-        ack_ref = generate_ack_ref()
-        message = Message.broadcast_message_with_ack(channel, event, payload, ack_ref)
+      do_broadcast_with_ack(pid, channel, event, payload)
+    end
+  end
 
-        with :ok <- Realtime.Connection.send_message_with_ack(pid, channel, message, ack_ref), do: {:ok, ack_ref}
-      else
-        message = Message.broadcast_message(channel, event, payload)
-        Realtime.Connection.send_message(pid, channel, message)
-      end
+  defp do_broadcast_with_ack(pid, channel, event, payload) do
+    if Channel.ack_enabled?(channel) do
+      ack_ref = generate_ack_ref()
+      message = Message.broadcast_message_with_ack(channel, event, payload, ack_ref)
+
+      with :ok <- Realtime.Connection.send_message_with_ack(pid, channel, message, ack_ref), do: {:ok, ack_ref}
+    else
+      message = Message.broadcast_message(channel, event, payload)
+      Realtime.Connection.send_message(pid, channel, message)
     end
   end
 
@@ -695,7 +699,7 @@ defmodule Supabase.Realtime do
         children =
           [
             {Channel.Store, name: store_name},
-            {Channel.Registry, module: module, name: registry_name, store: store_name},
+            {Channel.Registry, module: module, name: registry_name, store: store_name, connection: conn_name},
             {Realtime.Connection,
              name: conn_name,
              registry: registry_name,

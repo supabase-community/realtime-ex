@@ -71,12 +71,12 @@ defmodule Supabase.Realtime.ConnectionTest do
       ]
 
       assert {:ok, _conn_pid} = Connection.start_link(opts)
-      assert Process.whereis(conn_name) != nil
+      assert Process.whereis(conn_name)
     end
   end
 
   describe "send_message/3" do
-    test "returns error when not connected", %{
+    test "buffers messages when not connected", %{
       registry: registry,
       store: store,
       conn_name: conn_name,
@@ -100,9 +100,12 @@ defmodule Supabase.Realtime.ConnectionTest do
       # Force to closed state with nil socket
       :sys.replace_state(pid, fn state -> %{state | status: :closed, socket: nil} end)
 
-      # Try to send a message
+      # Messages are buffered instead of returning error
       payload = %{event: "test_event", payload: %{data: "test"}}
-      assert {:error, :not_connected} = Connection.send_message(pid, channel, payload)
+      assert :ok = Connection.send_message(pid, channel, payload)
+
+      state = :sys.get_state(pid)
+      assert state.send_buffer_size == 1
     end
   end
 

@@ -26,10 +26,18 @@ defmodule Supabase.Realtime.MixProject do
     [extra_applications: [:logger] ++ if(Mix.env() == :dev, do: [:wx, :observer], else: [])]
   end
 
+  defp supabase_dep do
+    if System.get_env("SUPABASE_LOCAL") == "1" do
+      {:supabase_potion, path: "../supabase-ex"}
+    else
+      {:supabase_potion, "~> 0.7"}
+    end
+  end
+
   defp deps do
     [
+      supabase_dep(),
       {:gun, "~> 2.1"},
-      {:supabase_potion, "~> 0.6"},
       {:mimic, "~> 1.1", only: :test},
       {:styler, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, ">= 0.0.0", only: [:dev], runtime: false},
