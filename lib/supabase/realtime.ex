@@ -697,6 +697,7 @@ defmodule Supabase.Realtime do
         reconnect_after_ms = opts[:reconnect_after_ms]
         http_fallback = opts[:http_fallback] || false
         access_token_fn = opts[:access_token_fn]
+        custom_params = opts[:params] || %{}
 
         children =
           [
@@ -710,7 +711,8 @@ defmodule Supabase.Realtime do
              heartbeat_interval: heartbeat_interval,
              reconnect_after_ms: reconnect_after_ms,
              http_fallback: http_fallback,
-             access_token_fn: access_token_fn}
+             access_token_fn: access_token_fn,
+             params: custom_params}
           ]
 
         Supervisor.init(children, strategy: :one_for_one)
