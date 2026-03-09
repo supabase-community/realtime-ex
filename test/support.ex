@@ -2,14 +2,10 @@ defmodule Support.Client do
   @moduledoc false
 
   def client do
-    {:ok, client} =
-      Supabase.init_client(
-        "https://example.supabase.co",
-        "test-api-key",
-        %{access_token: "test-access-token"}
-      )
-
-    client
+    Supabase.init_client!(
+      "https://example.supabase.co",
+      "test-api-key"
+    )
   end
 end
 
