@@ -61,7 +61,7 @@ defmodule Supabase.Realtime.MixProject do
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md"] ++ Path.wildcard("guides/*.md"),
+      extras: ["README.md", "CHANGELOG.md", "LICENSE"] ++ Path.wildcard("guides/*.md"),
       groups_for_extras: [Guides: ~r/guides\/.*/],
       groups_for_modules: [
         Core: [Supabase.Realtime, Supabase.Realtime.Connection],

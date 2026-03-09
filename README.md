@@ -3,10 +3,6 @@
 [![Hex.pm](https://img.shields.io/hexpm/v/supabase_realtime.svg)](https://hex.pm/packages/supabase_realtime)
 [![Docs](https://img.shields.io/badge/hex-docs-blue.svg)](https://hexdocs.pm/supabase_realtime)
 
-> [!WARNING]
->
-> This project is still in pre-release development. Expect breaking changes and evolving API.
-
 Elixir client for Supabase Realtime. Provides OTP-powered connectivity for real-time database changes, broadcast messages, and presence features.
 
 ## Features
