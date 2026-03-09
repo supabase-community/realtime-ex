@@ -41,7 +41,8 @@ defmodule Supabase.Realtime.Connection do
           send_buffer_size: non_neg_integer(),
           push_buffers: %{String.t() => :queue.queue()},
           http_fallback: boolean(),
-          access_token_fn: (-> {:ok, String.t()} | {:error, term()}) | {module(), atom(), list()} | nil
+          access_token_fn: (-> {:ok, String.t()} | {:error, term()}) | {module(), atom(), list()} | nil,
+          custom_params: map()
         }
 
   # Client API
@@ -146,7 +147,8 @@ defmodule Supabase.Realtime.Connection do
       send_buffer_size: 0,
       push_buffers: %{},
       http_fallback: opts[:http_fallback] || false,
-      access_token_fn: opts[:access_token_fn]
+      access_token_fn: opts[:access_token_fn],
+      custom_params: opts[:params] || %{}
     }
 
     {:ok, state, {:continue, :connect}}
@@ -171,7 +173,7 @@ defmodule Supabase.Realtime.Connection do
   def handle_continue(:upgrade, %{socket: socket} = state) do
     {:ok, client} = state.client.get_client()
     token = resolve_access_token(state, client)
-    uri = build_url(client)
+    uri = build_url(client, state.custom_params)
     path = uri.path <> if(uri.query == "", do: "", else: "?" <> uri.query)
 
     headers = [
@@ -259,12 +261,12 @@ defmodule Supabase.Realtime.Connection do
 
   def handle_info({:gun_upgrade, socket, stream, ["websocket"], _headers}, %{socket: socket, stream_ref: stream} = state) do
     Logger.debug("[#{__MODULE__}]: Connection upgraded to websocket with success")
-    {:noreply, flush_send_buffer(%{state | status: :open})}
+    {:noreply, flush_send_buffer(transition_status(state, :open))}
   end
 
   def handle_info({:gun_down, socket, _protocol, reason, _killed_streams}, %{socket: socket} = state) do
     Logger.debug("[#{__MODULE__}]: Connection down: #{inspect(reason)}")
-    updated_state = %{state | status: :closed}
+    updated_state = transition_status(state, :closed)
 
     if state.heartbeat_timer do
       Process.cancel_timer(state.heartbeat_timer)
@@ -288,7 +290,7 @@ defmodule Supabase.Realtime.Connection do
 
   def handle_info({:gun_ws, socket, stream, {:close, _, _}}, %{socket: socket, stream_ref: stream} = state) do
     Logger.debug("[#{__MODULE__}]: WebSocket closed")
-    {:noreply, %{state | status: :closed}}
+    {:noreply, transition_status(state, :closed)}
   end
 
   def handle_info(:heartbeat, %{socket: nil, status: status} = state) when status != :open do
@@ -349,6 +351,18 @@ defmodule Supabase.Realtime.Connection do
     if state.reconnect_timer, do: Process.cancel_timer(state.reconnect_timer)
 
     :ok
+  end
+
+  # State transition with notification
+
+  defp transition_status(state, new_status) do
+    old = state.status
+
+    if old != new_status and state.registry do
+      GenServer.cast(state.registry, {:connection_state_changed, old, new_status})
+    end
+
+    %{state | status: new_status}
   end
 
   # Buffer helpers
@@ -447,7 +461,7 @@ defmodule Supabase.Realtime.Connection do
 
   defp connect(state) do
     {:ok, client} = state.client.get_client()
-    uri = build_url(client)
+    uri = build_url(client, state.custom_params)
 
     host = String.to_charlist(uri.host)
     port = uri.port || if uri.scheme == "wss", do: 443, else: 80
@@ -474,8 +488,9 @@ defmodule Supabase.Realtime.Connection do
     end
   end
 
-  defp build_url(%Supabase.Client{} = client) do
-    query = URI.encode_query(%{apikey: client.api_key, vsn: "1.0.0"})
+  defp build_url(%Supabase.Client{} = client, custom_params) do
+    base_params = %{apikey: client.api_key, vsn: "1.0.0"}
+    query = base_params |> Map.merge(custom_params) |> URI.encode_query()
 
     client.realtime_url
     |> URI.new!()

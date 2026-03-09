@@ -13,6 +13,7 @@ defmodule Supabase.Realtime.Channel.Registry do
   alias Supabase.Realtime.Channel
   alias Supabase.Realtime.Channel.Store
   alias Supabase.Realtime.Message
+  alias Supabase.Realtime.PostgresTypes
 
   require Logger
 
@@ -181,6 +182,12 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   @impl true
+  def handle_cast({:connection_state_changed, old, new}, state) do
+    channels = Store.all(state.store)
+    dispatch_event(state, channels, {:connection, :state_change, %{old: old, new: new}})
+    {:noreply, state}
+  end
+
   def handle_cast({:handle_message, %{"event" => event, "payload" => payload} = msg}, state) do
     matching_channels = Store.find_all_by_topic(state.store, msg["topic"])
 
@@ -287,7 +294,8 @@ defmodule Supabase.Realtime.Channel.Registry do
   defp handle_event(channels, event, payload, state) when is_database_event(event) do
     db_event_type = event |> String.downcase() |> String.to_atom()
     matching = filter_by_server_ids(channels, payload)
-    dispatch_event(state, matching, {:postgres_changes, db_event_type, payload})
+    transformed_payload = transform_db_payload(payload)
+    dispatch_event(state, matching, {:postgres_changes, db_event_type, transformed_payload})
     {:noreply, state}
   end
 
@@ -331,6 +339,21 @@ defmodule Supabase.Realtime.Channel.Registry do
     matching = filter_by_event(channels, "broadcast", event)
     dispatch_event(state, matching, {:broadcast, event, payload})
     {:noreply, state}
+  end
+
+  defp transform_db_payload(payload) do
+    columns = Map.get(payload, "columns", [])
+
+    payload
+    |> maybe_transform("record", columns)
+    |> maybe_transform("old_record", columns)
+  end
+
+  defp maybe_transform(payload, key, columns) do
+    case Map.get(payload, key) do
+      nil -> payload
+      record -> Map.put(payload, key, PostgresTypes.transform(record, columns))
+    end
   end
 
   defp filter_by_server_ids(channels, payload) do
