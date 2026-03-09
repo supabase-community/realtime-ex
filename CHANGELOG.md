@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.4.0](https://github.com/supabase-community/realtime-ex/compare/v0.3.0...v0.4.0) (2026-03-09)
+
+
+### Features
+
+* developer experience and observability ([#33](https://github.com/supabase-community/realtime-ex/issues/33)) ([373e26a](https://github.com/supabase-community/realtime-ex/commit/373e26af778d12e746fc48db4aa6721d85c673c2))
+* **phase-2:** http fallback, token refresh, broadcast.self and wildcard events ([#32](https://github.com/supabase-community/realtime-ex/issues/32)) ([ffd2f5f](https://github.com/supabase-community/realtime-ex/commit/ffd2f5f43a0b2a87b5587ae4a8258dcbf2a73984))
+* supabase-ex integration and documentation ([#35](https://github.com/supabase-community/realtime-ex/issues/35)) ([14c200b](https://github.com/supabase-community/realtime-ex/commit/14c200b2f4a7fb63437a714cc4fa42012d0cbb46))
+
+
+### Continuous Integration
+
+* add automatic hex publish ([ee1e522](https://github.com/supabase-community/realtime-ex/commit/ee1e522141faff5b27919a233294a53430ae9d93))
+
 ## [0.3.0](https://github.com/supabase-community/realtime-ex/compare/v0.2.0...v0.3.0) (2026-03-09)
 
 ### Features
