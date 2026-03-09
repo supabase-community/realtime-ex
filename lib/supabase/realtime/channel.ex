@@ -79,13 +79,21 @@ defmodule Supabase.Realtime.Channel do
     params = opts[:params] || %{}
     config = Map.get(params, :config, %{})
 
+    broadcast_opts = opts[:broadcast]
+    presence_opts = opts[:presence]
+
     default_config = %{
       broadcast: %{ack: false, self: false},
       presence: %{key: ""},
       private: false
     }
 
-    merged_config = Map.merge(default_config, config)
+    merged_config =
+      default_config
+      |> Map.merge(config)
+      |> maybe_merge_broadcast(broadcast_opts)
+      |> maybe_merge_presence(presence_opts)
+
     merged_params = Map.put(params, :config, merged_config)
 
     %__MODULE__{
@@ -148,6 +156,7 @@ defmodule Supabase.Realtime.Channel do
   @spec add_binding(t(), String.t(), Enumerable.t(), (map() -> any()) | nil) :: t()
   def add_binding(%__MODULE__{} = channel, type, filter, callback \\ nil) do
     filter = if is_list(filter), do: Map.new(filter), else: filter
+    filter = normalize_event_filter(filter)
 
     binding = %{
       type: type,
@@ -378,6 +387,23 @@ defmodule Supabase.Realtime.Channel do
     Enum.all?(filter_keys, fn key ->
       Map.get(binding.filter, key) == Map.get(filter, key)
     end)
+  end
+
+  defp normalize_event_filter(%{event: :all} = filter), do: %{filter | event: "*"}
+  defp normalize_event_filter(filter), do: filter
+
+  defp maybe_merge_broadcast(config, nil), do: config
+
+  defp maybe_merge_broadcast(config, opts) when is_list(opts) do
+    broadcast = Map.merge(config.broadcast, Map.new(opts))
+    %{config | broadcast: broadcast}
+  end
+
+  defp maybe_merge_presence(config, nil), do: config
+
+  defp maybe_merge_presence(config, opts) when is_list(opts) do
+    presence = Map.merge(config.presence, Map.new(opts))
+    %{config | presence: presence}
   end
 
   defp generate_ref do

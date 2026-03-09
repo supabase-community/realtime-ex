@@ -39,7 +39,9 @@ defmodule Supabase.Realtime.Connection do
           reconnect_after_ms: (non_neg_integer() -> pos_integer()),
           send_buffer: :queue.queue(),
           send_buffer_size: non_neg_integer(),
-          push_buffers: %{String.t() => :queue.queue()}
+          push_buffers: %{String.t() => :queue.queue()},
+          http_fallback: boolean(),
+          access_token_fn: (-> {:ok, String.t()} | {:error, term()}) | {module(), atom(), list()} | nil
         }
 
   # Client API
@@ -142,7 +144,9 @@ defmodule Supabase.Realtime.Connection do
       reconnect_after_ms: reconnect_function,
       send_buffer: :queue.new(),
       send_buffer_size: 0,
-      push_buffers: %{}
+      push_buffers: %{},
+      http_fallback: opts[:http_fallback] || false,
+      access_token_fn: opts[:access_token_fn]
     }
 
     {:ok, state, {:continue, :connect}}
@@ -166,13 +170,14 @@ defmodule Supabase.Realtime.Connection do
 
   def handle_continue(:upgrade, %{socket: socket} = state) do
     {:ok, client} = state.client.get_client()
+    token = resolve_access_token(state, client)
     uri = build_url(client)
     path = uri.path <> if(uri.query == "", do: "", else: "?" <> uri.query)
 
     headers = [
       {~c"user-agent", ~c"SupabasePotion/#{version()}"},
       {~c"x-client-info", ~c"supabase-realtime-elixir/#{version()}"},
-      {~c"authorization", ~c"Bearer #{client.access_token || client.apikey}"}
+      {~c"authorization", ~c"Bearer #{token}"}
     ]
 
     stream_ref = :gun.ws_upgrade(socket, path, headers)
@@ -184,9 +189,14 @@ defmodule Supabase.Realtime.Connection do
   def handle_call(:state, _from, state), do: {:reply, state.status, state}
 
   def handle_call({:send_message, channel, payload}, _from, %{status: status} = state) when status != :open do
-    Logger.debug("[#{inspect(__MODULE__)}]: Buffering message for channel: #{channel.topic}")
-    state = enqueue_send_buffer(state, channel, payload)
-    {:reply, :ok, state}
+    if state.http_fallback and broadcast_payload?(payload) do
+      result = try_http_fallback(state, channel, payload)
+      {:reply, result, state}
+    else
+      Logger.debug("[#{inspect(__MODULE__)}]: Buffering message for channel: #{channel.topic}")
+      state = enqueue_send_buffer(state, channel, payload)
+      {:reply, :ok, state}
+    end
   end
 
   def handle_call({:send_message, channel, payload}, _from, state) do
@@ -396,6 +406,41 @@ defmodule Supabase.Realtime.Connection do
         send_message_to_topic(channel, payload, state)
         state
     end
+  end
+
+  # Token resolution
+
+  defp resolve_access_token(%{access_token_fn: nil}, client) do
+    client.access_token || client.apikey
+  end
+
+  defp resolve_access_token(%{access_token_fn: fun}, client) when is_function(fun, 0) do
+    case fun.() do
+      {:ok, token} -> token
+      {:error, _} -> client.access_token || client.apikey
+    end
+  end
+
+  defp resolve_access_token(%{access_token_fn: {mod, fun, args}}, client) do
+    case apply(mod, fun, args) do
+      {:ok, token} -> token
+      {:error, _} -> client.access_token || client.apikey
+    end
+  end
+
+  # HTTP fallback
+
+  defp broadcast_payload?(%{event: "broadcast"}), do: true
+  defp broadcast_payload?(%{payload: %{type: "broadcast"}}), do: true
+  defp broadcast_payload?(_), do: false
+
+  defp try_http_fallback(state, channel, payload) do
+    {:ok, client} = state.client.get_client()
+    token = resolve_access_token(state, client)
+    event = get_in(payload, [:payload, :event]) || payload[:event] || "broadcast"
+    inner_payload = get_in(payload, [:payload, :payload]) || payload[:payload] || %{}
+
+    Realtime.HTTP.broadcast(client, token, channel.topic, event, inner_payload)
   end
 
   # Private helper functions

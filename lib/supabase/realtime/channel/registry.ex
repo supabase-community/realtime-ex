@@ -328,8 +328,8 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   defp handle_event(channels, event, payload, state) do
-    # Default to broadcast handling
-    dispatch_event(state, channels, {:broadcast, event, payload})
+    matching = filter_by_event(channels, "broadcast", event)
+    dispatch_event(state, matching, {:broadcast, event, payload})
     {:noreply, state}
   end
 
@@ -345,6 +345,17 @@ defmodule Supabase.Realtime.Channel.Registry do
     bindings = Map.get(channel.bindings, "postgres_changes", [])
     bindings == [] or Enum.any?(bindings, fn b -> b.id in server_ids end)
   end
+
+  defp filter_by_event(channels, binding_type, event) do
+    Enum.filter(channels, fn channel ->
+      bindings = Map.get(channel.bindings, binding_type, [])
+      bindings == [] or Enum.any?(bindings, &event_matches?(&1, event))
+    end)
+  end
+
+  defp event_matches?(%{filter: %{event: "*"}}, _event), do: true
+  defp event_matches?(%{filter: %{event: filter_event}}, event), do: filter_event == event
+  defp event_matches?(_, _), do: true
 
   defp maybe_update_binding_ids(channel, %{"response" => %{"postgres_changes" => server_bindings}}, state)
        when is_list(server_bindings) do
