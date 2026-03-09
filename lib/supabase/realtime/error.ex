@@ -1,6 +1,29 @@
 defmodule Supabase.Realtime.Error do
   @moduledoc """
   Structured error for Supabase Realtime operations.
+
+  Provides a standard error struct with a reason atom, a human-readable message,
+  and an optional context map. Implements the `Exception` behaviour so it can
+  be raised or matched in rescue blocks.
+
+  ## Creating Errors
+
+      error = Supabase.Realtime.Error.new(:not_connected, "WebSocket is not open")
+      #=> %Supabase.Realtime.Error{reason: :not_connected, message: "WebSocket is not open", context: %{}}
+
+      error = Supabase.Realtime.Error.new(:timeout, "Channel join timed out", %{topic: "realtime:room"})
+      #=> %Supabase.Realtime.Error{reason: :timeout, message: "Channel join timed out", context: %{topic: "realtime:room"}}
+
+  ## Converting to Supabase.Error
+
+  Use `to_supabase_error/1` to convert a Realtime error into a `Supabase.Error`
+  struct. This is useful for passing errors to code that expects the shared
+  supabase-ex error format.
+
+      error = Supabase.Realtime.Error.new(:not_connected, "WebSocket is not open")
+      supabase_error = Supabase.Realtime.Error.to_supabase_error(error)
+      supabase_error.code     #=> :not_connected
+      supabase_error.service  #=> :realtime
   """
 
   @type t :: %__MODULE__{

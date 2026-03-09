@@ -2,8 +2,37 @@ defmodule Supabase.Realtime.Channel do
   @moduledoc """
   Represents a subscription channel for Supabase Realtime events.
 
-  A channel narrows the scope of data flow to subscribed clients. Channels are
-  created with a topic and can have multiple event subscriptions.
+  A channel narrows the scope of data flow to subscribed clients. Each channel
+  is created with a topic and can hold multiple event bindings.
+
+  ## Broadcast Options
+
+  When creating a channel, you can pass broadcast options:
+
+  * `broadcast: [self: true]` - Receive your own broadcast messages on this
+    channel. By default, the server does not echo your broadcasts back to you.
+  * `broadcast: [ack: true]` - Enable delivery confirmation for broadcasts.
+    Use `broadcast_with_ack/3` and `wait_for_ack/2` to send and confirm.
+
+  ## Presence
+
+  * `presence: [key: "user:123"]` - Set a custom presence key for this channel.
+    This key identifies the client in presence state maps.
+
+  ## Wildcard Events
+
+  You can subscribe to all events of a given type using `event: :all` or
+  `event: "*"`. This works for both broadcast and postgres_changes bindings.
+
+      Realtime.on(channel, "broadcast", event: "*")
+      Realtime.on(channel, "postgres_changes", event: :all, schema: "public")
+
+  ## Example
+
+      {:ok, channel} = MyApp.Realtime.channel("room:lobby",
+        broadcast: [self: true, ack: true],
+        presence: [key: "user:42"]
+      )
   """
 
   alias Supabase.Realtime

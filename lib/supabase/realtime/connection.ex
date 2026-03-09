@@ -2,11 +2,44 @@ defmodule Supabase.Realtime.Connection do
   @moduledoc """
   WebSocket connection manager for Supabase Realtime.
 
-  This module is responsible for:
-  * Establishing and maintaining the WebSocket connection
-  * Sending and receiving messages
-  * Handling reconnection with exponential backoff
-  * Managing heartbeats to detect connection health
+  Handles the full lifecycle of a WebSocket connection to the Supabase
+  Realtime service.
+
+  ## Responsibilities
+
+  * Establishing and maintaining the WebSocket connection.
+  * Sending and receiving messages.
+  * Reconnection with exponential backoff. The default strategy doubles the
+    delay on each attempt, up to 10 seconds. You can supply your own function
+    with the `:reconnect_after_ms` option.
+  * Heartbeats to detect connection health.
+
+  ## Buffers
+
+  Messages sent while the connection is down are placed in a **send buffer**
+  (up to 100 entries). Once the WebSocket upgrades, the buffer is flushed in
+  order. Messages sent while a channel is still joining go into a per-topic
+  **push buffer** that flushes when the channel reaches the `:joined` state.
+
+  ## HTTP Fallback
+
+  When `:http_fallback` is `true` and the WebSocket is not open, broadcast
+  messages are delivered through the REST API instead of being buffered.
+  Other message types are still buffered normally. See `Supabase.Realtime.HTTP`
+  for details.
+
+  ## Token Resolution
+
+  The access token used for the WebSocket upgrade is resolved in this order:
+
+  1. The `:access_token_fn` option, if provided and returns `{:ok, token}`.
+  2. `client.access_token`, if set on the `%Supabase.Client{}` struct.
+  3. `client.apikey` as a last resort.
+
+  ## Custom Params
+
+  Any map passed as `:params` is merged into the WebSocket URL query string
+  alongside the default `apikey` and `vsn` params.
   """
 
   use GenServer

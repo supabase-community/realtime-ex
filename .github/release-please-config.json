@@ -64,6 +64,11 @@
       "type": "generic",
       "path": "README.md",
       "glob": false
+    },
+    {
+      "type": "generic",
+      "path": "guides/installation.md",
+      "glob": false
     }
   ],
   "packages": {

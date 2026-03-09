@@ -54,14 +54,29 @@ defmodule Supabase.Realtime.MixProject do
         "GitHub" => @source_url,
         "Docs" => "https://hexdocs.pm/supabase_realtime"
       },
-      files: ~w[lib mix.exs README.md LICENSE]
+      files: ~w[lib guides mix.exs README.md LICENSE]
     }
   end
 
   defp docs do
     [
       main: "readme",
-      extras: ["README.md", "CHANGELOG.md"]
+      extras: ["README.md", "CHANGELOG.md"] ++ Path.wildcard("guides/*.md"),
+      groups_for_extras: [Guides: ~r/guides\/.*/],
+      groups_for_modules: [
+        Core: [Supabase.Realtime, Supabase.Realtime.Connection],
+        Channels: [
+          Supabase.Realtime.Channel,
+          Supabase.Realtime.Channel.Registry,
+          Supabase.Realtime.Channel.Store
+        ],
+        Utilities: [
+          Supabase.Realtime.HTTP,
+          Supabase.Realtime.Message,
+          Supabase.Realtime.Error,
+          Supabase.Realtime.PostgresTypes
+        ]
+      ]
     ]
   end
 

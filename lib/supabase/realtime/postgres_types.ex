@@ -1,6 +1,39 @@
 defmodule Supabase.Realtime.PostgresTypes do
   @moduledoc """
   Transforms postgres_changes payload column values from strings to native Elixir types.
+
+  ## Supported Types
+
+  | Postgres type                         | Elixir type       |
+  |---------------------------------------|-------------------|
+  | `bool`, `boolean`                     | `boolean()`       |
+  | `int2`, `int4`, `int8`, `smallint`,   | `integer()`       |
+  |   `integer`, `bigint`                 |                   |
+  | `float4`, `float8`, `real`, `double`  | `float()`         |
+  | `numeric`                             | `integer()` or `float()` |
+  | `json`, `jsonb`                       | decoded term      |
+  | `timestamp`, `timestamptz`            | `DateTime.t()`    |
+  | `date`                                | `Date.t()`        |
+  | `time`, `timetz`                      | `Time.t()`        |
+  | `uuid`                                | `String.t()`      |
+  | `text`, `varchar`, `char`, `name`,    | `String.t()`      |
+  |   `citext`                            |                   |
+  | Array types (e.g. `_int4`, `_text`)   | `list()` of the inner type |
+
+  Any type not listed above is returned as-is.
+
+  ## Examples
+
+      columns = [
+        %{"name" => "id", "type" => "int8"},
+        %{"name" => "active", "type" => "bool"},
+        %{"name" => "score", "type" => "float8"}
+      ]
+
+      record = %{"id" => "42", "active" => "true", "score" => "9.5"}
+
+      PostgresTypes.transform(record, columns)
+      #=> %{"id" => 42, "active" => true, "score" => 9.5}
   """
 
   @doc """

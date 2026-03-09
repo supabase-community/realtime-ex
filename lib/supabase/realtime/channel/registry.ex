@@ -2,9 +2,33 @@ defmodule Supabase.Realtime.Channel.Registry do
   @moduledoc """
   Registry for managing Realtime channel subscriptions.
 
-  This module is responsible for tracking active channels and their subscriptions,
-  and for routing messages to the appropriate callback functions when events
-  are received.
+  Tracks active channels and their subscriptions, and routes incoming messages
+  to the appropriate callback functions.
+
+  ## Message Routing
+
+  When a message arrives, the registry matches it against channel bindings:
+
+  * **Broadcast events** are matched by event name. Bindings with `event: "*"`
+    (wildcard) match every broadcast event on the channel.
+  * **Postgres changes** are matched by server-assigned binding IDs. After a
+    channel joins, the server reply includes IDs for each postgres_changes
+    binding. The registry stores these IDs so that incoming database events
+    are dispatched only to the correct bindings.
+  * **Presence events** are dispatched to all channels subscribed to the topic.
+
+  ## Connection State Notifications
+
+  When the WebSocket connection state changes (for example, from `:open` to
+  `:closed`), the connection process notifies the registry. The registry then
+  dispatches a `{:connection, :state_change, %{old: old, new: new}}` event
+  to all registered callback modules.
+
+  ## Postgres Type Transforms
+
+  Database change payloads include column metadata. The registry uses
+  `Supabase.Realtime.PostgresTypes` to convert string values in `record`
+  and `old_record` maps to native Elixir types before dispatching events.
   """
 
   use GenServer
