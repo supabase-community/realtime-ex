@@ -23,3 +23,5 @@ supabase_realtime-*.tar
 /tmp/
 
 /priv/plts/
+/.claude/
+/.expert/
