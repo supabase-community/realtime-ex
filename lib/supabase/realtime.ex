@@ -204,13 +204,13 @@ defmodule Supabase.Realtime do
   """
   @type realtime_listen_type :: :broadcast | :presence | :postgres_changes | :system
 
-  @type client :: module() | atom()
+  @type client :: Supabase.Client.t()
   @type t :: pid() | atom()
   @type channel :: Channel.t()
   @type event_type :: :postgres_changes | :broadcast | :presence
   @type event_filter :: Enumerable.t()
   @type channel_opts :: keyword()
-  @type start_option :: {:name, atom()} | {:supabase_client, client()} | {:timeout, pos_integer()}
+  @type start_option :: {:name, atom()} | {:client, Supabase.Client.t()} | {:timeout, pos_integer()}
   @typedoc """
   Types of PostgreSQL database changes.
 
@@ -331,7 +331,7 @@ defmodule Supabase.Realtime do
   ## Options
 
   * `:name` - Registers the process with the given name
-  * `:supabase_client` - The Supabase client to use for configuration
+  * `:client` - A `%Supabase.Client{}` struct created via `Supabase.init_client/3`
   * `:timeout` - Connection timeout in milliseconds (default: 10000)
   * `:heartbeat_interval` - Interval in milliseconds between heartbeats (default: 30s)
   * `:reconnect_after_ms` - Function that returns reconnection delay based on attempts
@@ -689,7 +689,7 @@ defmodule Supabase.Realtime do
       @impl Supervisor
       def init(opts) do
         module = opts[:name] || __MODULE__
-        client = Keyword.fetch!(opts, :supabase_client)
+        client = Keyword.fetch!(opts, :client)
         heartbeat_interval = opts[:heartbeat_interval] || to_timeout(second: 30)
         store_name = Module.concat(module, Store)
         registry_name = Module.concat(module, Registry)

@@ -8,18 +8,12 @@ defmodule Supabase.Realtime.ConnectionStateChangeTest do
 
   @moduletag capture_log: true
 
-  defmodule MockClient do
-    @moduledoc false
-    def get_client do
-      {:ok,
-       %Supabase.Client{
-         api_key: "mock_api_key",
-         realtime_url: "https://example.com",
-         base_url: "https://example.com",
-         access_token: "mock_token"
-       }}
-    end
-  end
+  @mock_client %Supabase.Client{
+    api_key: "mock_api_key",
+    realtime_url: "https://example.com",
+    base_url: "https://example.com",
+    access_token: "mock_token"
+  }
 
   setup do
     set_mimic_global()
@@ -45,7 +39,7 @@ defmodule Supabase.Realtime.ConnectionStateChangeTest do
       name: ctx.conn_name,
       registry: ctx.registry,
       store: ctx.store,
-      client: MockClient,
+      client: @mock_client,
       params: %{log_level: "debug"}
     ]
 
@@ -65,7 +59,7 @@ defmodule Supabase.Realtime.ConnectionStateChangeTest do
       name: ctx.conn_name,
       registry: ctx.registry,
       store: ctx.store,
-      client: MockClient
+      client: @mock_client
     ]
 
     {:ok, pid} = Connection.start_link(opts)

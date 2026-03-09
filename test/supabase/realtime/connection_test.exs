@@ -11,19 +11,12 @@ defmodule Supabase.Realtime.ConnectionTest do
 
   @moduletag capture_log: true
 
-  # Mock client for tests
-  defmodule MockClient do
-    @moduledoc false
-    def get_client do
-      {:ok,
-       %Supabase.Client{
-         api_key: "mock_api_key",
-         realtime_url: "https://example.com",
-         base_url: "https://example.com",
-         access_token: "mock_token"
-       }}
-    end
-  end
+  @mock_client %Supabase.Client{
+    api_key: "mock_api_key",
+    realtime_url: "https://example.com",
+    base_url: "https://example.com",
+    access_token: "mock_token"
+  }
 
   setup do
     # Set Mimic global for this test module
@@ -67,7 +60,7 @@ defmodule Supabase.Realtime.ConnectionTest do
         name: conn_name,
         registry: registry,
         store: store,
-        client: MockClient
+        client: @mock_client
       ]
 
       assert {:ok, _conn_pid} = Connection.start_link(opts)
@@ -91,7 +84,7 @@ defmodule Supabase.Realtime.ConnectionTest do
         name: conn_name,
         registry: registry,
         store: store,
-        client: MockClient
+        client: @mock_client
       ]
 
       {:ok, pid} = Connection.start_link(opts)
@@ -120,7 +113,7 @@ defmodule Supabase.Realtime.ConnectionTest do
         name: conn_name,
         registry: registry,
         store: store,
-        client: MockClient
+        client: @mock_client
       ]
 
       {:ok, pid} = Connection.start_link(opts)
@@ -152,7 +145,7 @@ defmodule Supabase.Realtime.ConnectionTest do
       name: conn_name,
       registry: registry,
       store: store,
-      client: MockClient,
+      client: @mock_client,
       # Short delay for testing
       reconnect_after_ms: fn _ -> 500 end
     ]
@@ -181,7 +174,7 @@ defmodule Supabase.Realtime.ConnectionTest do
       name: conn_name,
       registry: registry,
       store: store,
-      client: MockClient
+      client: @mock_client
     ]
 
     {:ok, pid} = Connection.start_link(opts)
@@ -191,7 +184,7 @@ defmodule Supabase.Realtime.ConnectionTest do
     state = :sys.get_state(pid)
     assert state.registry == registry
     assert state.store == store
-    assert state.client == MockClient
+    assert state.client == @mock_client
     # default
     assert state.heartbeat_interval == 30_000
 

@@ -1,7 +1,16 @@
 defmodule Support.Client do
   @moduledoc false
 
-  use Supabase.Client, otp_app: :supabase_realtime
+  def client do
+    {:ok, client} =
+      Supabase.init_client(
+        "https://example.supabase.co",
+        "test-api-key",
+        %{access_token: "test-access-token"}
+      )
+
+    client
+  end
 end
 
 defmodule Support.Realtime do
@@ -32,9 +41,10 @@ defmodule Support.Supervisor do
 
   @impl true
   def init(:ok) do
+    client = Support.Client.client()
+
     children = [
-      Support.Client,
-      {Support.Realtime, supabase_client: Support.Client, heartbeat_interval: to_timeout(hour: 3)}
+      {Support.Realtime, client: client, heartbeat_interval: to_timeout(hour: 3)}
     ]
 
     Supervisor.init(children, strategy: :one_for_one)

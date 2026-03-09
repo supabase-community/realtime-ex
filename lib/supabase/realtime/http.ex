@@ -24,7 +24,7 @@ defmodule Supabase.Realtime.HTTP do
   """
   @spec broadcast(Supabase.Client.t(), String.t(), String.t(), String.t(), map()) ::
           :ok | {:error, term()}
-  def broadcast(client, token, topic, event, payload) do
+  def broadcast(%Supabase.Client{} = client, token, topic, event, payload) do
     body = %{
       messages: [
         %{topic: topic, event: event, payload: payload}

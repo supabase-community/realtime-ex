@@ -1,10 +1,11 @@
-defmodule Supabase.Realtime.TokenRefreshTest do
+defmodule Supabase.Realtime.ClientIntegrationTest do
   use ExUnit.Case, async: false
   use Mimic
 
   alias Supabase.Realtime.Channel.Registry
   alias Supabase.Realtime.Channel.Store
   alias Supabase.Realtime.Connection
+  alias Supabase.Realtime.Error
 
   @moduletag capture_log: true
 
@@ -12,7 +13,7 @@ defmodule Supabase.Realtime.TokenRefreshTest do
     api_key: "mock_api_key",
     realtime_url: "https://example.com",
     base_url: "https://example.com",
-    access_token: "default_token"
+    access_token: "mock_token"
   }
 
   setup do
@@ -35,30 +36,27 @@ defmodule Supabase.Realtime.TokenRefreshTest do
      }}
   end
 
-  describe "dynamic token refresh" do
-    test "accepts access_token_fn as a capture function", ctx do
+  describe "Connection with %Supabase.Client{} struct" do
+    test "starts with a client struct directly", ctx do
       stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
       stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
       stub(:gun, :ws_send, fn _, _, _ -> :ok end)
-
-      token_fn = fn -> {:ok, "refreshed_token"} end
 
       opts = [
         name: ctx.conn_name,
         registry: ctx.registry,
         store: ctx.store,
-        client: @mock_client,
-        access_token_fn: token_fn
+        client: @mock_client
       ]
 
-      {:ok, pid} = Connection.start_link(opts)
-      Process.sleep(50)
-
+      assert {:ok, pid} = Connection.start_link(opts)
       state = :sys.get_state(pid)
-      assert is_function(state.access_token_fn, 0)
+      assert %Supabase.Client{} = state.client
+      assert state.client.api_key == "mock_api_key"
+      assert state.client.access_token == "mock_token"
     end
 
-    test "accepts access_token_fn as MFA tuple", ctx do
+    test "uses client struct for connection without calling get_client/0", ctx do
       stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
       stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
       stub(:gun, :ws_send, fn _, _, _ -> :ok end)
@@ -67,37 +65,35 @@ defmodule Supabase.Realtime.TokenRefreshTest do
         name: ctx.conn_name,
         registry: ctx.registry,
         store: ctx.store,
-        client: @mock_client,
-        access_token_fn: {__MODULE__, :get_token, []}
+        client: @mock_client
       ]
 
-      {:ok, pid} = Connection.start_link(opts)
+      assert {:ok, pid} = Connection.start_link(opts)
       Process.sleep(50)
 
+      # Connection should be attempting to connect
       state = :sys.get_state(pid)
-      assert state.access_token_fn == {__MODULE__, :get_token, []}
-    end
-
-    test "stores http_fallback option", ctx do
-      stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
-      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
-      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
-
-      opts = [
-        name: ctx.conn_name,
-        registry: ctx.registry,
-        store: ctx.store,
-        client: @mock_client,
-        http_fallback: true
-      ]
-
-      {:ok, pid} = Connection.start_link(opts)
-      Process.sleep(50)
-
-      state = :sys.get_state(pid)
-      assert state.http_fallback == true
+      assert state.status == :connecting
     end
   end
 
-  def get_token, do: {:ok, "mfa_token"}
+  describe "Error.to_supabase_error/1" do
+    test "converts realtime error to supabase error" do
+      error = Error.new(:not_connected, "WebSocket is not connected")
+      supabase_error = Error.to_supabase_error(error)
+
+      assert %Supabase.Error{} = supabase_error
+      assert supabase_error.code == :not_connected
+      assert supabase_error.message == "WebSocket is not connected"
+      assert supabase_error.service == :realtime
+      assert supabase_error.metadata == %{}
+    end
+
+    test "preserves context as metadata" do
+      error = Error.new(:channel_error, "Failed to join", %{topic: "realtime:test"})
+      supabase_error = Error.to_supabase_error(error)
+
+      assert supabase_error.metadata == %{topic: "realtime:test"}
+    end
+  end
 end

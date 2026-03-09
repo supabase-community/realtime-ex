@@ -24,4 +24,23 @@ defmodule Supabase.Realtime.Error do
   def new(reason, message, context \\ %{}) do
     %__MODULE__{reason: reason, message: message, context: context}
   end
+
+  @doc """
+  Converts a `Supabase.Realtime.Error` to a `Supabase.Error` struct.
+
+  This allows interoperability with the broader supabase-ex error handling.
+
+  ## Examples
+
+      iex> error = Supabase.Realtime.Error.new(:not_connected, "WebSocket is not connected")
+      iex> supabase_error = Supabase.Realtime.Error.to_supabase_error(error)
+      iex> supabase_error.code
+      :not_connected
+      iex> supabase_error.service
+      :realtime
+  """
+  @spec to_supabase_error(t()) :: Supabase.Error.t()
+  def to_supabase_error(%__MODULE__{reason: reason, message: message, context: context}) do
+    Supabase.Error.new(code: reason, message: message, service: :realtime, metadata: context)
+  end
 end

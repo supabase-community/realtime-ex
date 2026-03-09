@@ -24,8 +24,7 @@ defmodule Supabase.Realtime.Connection do
   Connection state.
   """
   @type state :: %{
-          url: String.t(),
-          params: map(),
+          client: Supabase.Client.t(),
           registry: atom() | pid(),
           store: atom() | pid(),
           socket: pid() | nil,
@@ -54,7 +53,7 @@ defmodule Supabase.Realtime.Connection do
 
   * `:name` - Optional registration name
   * `:registry` - Registry process name
-  * `:client` - The `Supabase.Client` self-managed client name
+  * `:client` - A `%Supabase.Client{}` struct
   * `:heartbeat_interval` - Interval in milliseconds between heartbeats
   * `:reconnect_after_ms` - Function that returns reconnection delay based on attempts
   """
@@ -171,7 +170,7 @@ defmodule Supabase.Realtime.Connection do
   end
 
   def handle_continue(:upgrade, %{socket: socket} = state) do
-    {:ok, client} = state.client.get_client()
+    client = state.client
     token = resolve_access_token(state, client)
     uri = build_url(client, state.custom_params)
     path = uri.path <> if(uri.query == "", do: "", else: "?" <> uri.query)
@@ -449,7 +448,7 @@ defmodule Supabase.Realtime.Connection do
   defp broadcast_payload?(_), do: false
 
   defp try_http_fallback(state, channel, payload) do
-    {:ok, client} = state.client.get_client()
+    client = state.client
     token = resolve_access_token(state, client)
     event = get_in(payload, [:payload, :event]) || payload[:event] || "broadcast"
     inner_payload = get_in(payload, [:payload, :payload]) || payload[:payload] || %{}
@@ -460,7 +459,7 @@ defmodule Supabase.Realtime.Connection do
   # Private helper functions
 
   defp connect(state) do
-    {:ok, client} = state.client.get_client()
+    client = state.client
     uri = build_url(client, state.custom_params)
 
     host = String.to_charlist(uri.host)
