@@ -625,6 +625,24 @@ defmodule Supabase.Realtime do
   end
 
   @doc """
+  Lists all active channel subscriptions.
+
+  ## Parameters
+
+  * `registry` - The channel registry module or PID
+
+  ## Returns
+
+  * A list of `%Channel{}` structs
+  """
+  @spec list_channels(client() | t()) :: [channel()] | {:error, term()}
+  def list_channels(registry) do
+    with pid when is_pid(pid) <- ensure_pid(registry) do
+      Channel.Registry.list_channels(pid)
+    end
+  end
+
+  @doc """
   Removes all channel subscriptions.
 
   ## Parameters
@@ -740,6 +758,15 @@ defmodule Supabase.Realtime do
       def channel(topic, opts \\ []) do
         with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
           Realtime.channel(registry, topic, opts)
+        end
+      end
+
+      @doc """
+      Check `Supabase.Realtime.list_channels/1` for more information.
+      """
+      def list_channels do
+        with {:ok, registry} <- Realtime.fetch_channel_registry(__MODULE__) do
+          Realtime.list_channels(registry)
         end
       end
 
