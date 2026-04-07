@@ -13,6 +13,10 @@ defmodule Supabase.Realtime.Channel do
     channel. By default, the server does not echo your broadcasts back to you.
   * `broadcast: [ack: true]` - Enable delivery confirmation for broadcasts.
     Use `broadcast_with_ack/3` and `wait_for_ack/2` to send and confirm.
+  * `broadcast: [replay: [since: epoch, limit: n]]` - Enable message replay
+    for missed broadcasts. Only available on private channels. The `since` value
+    is a Unix epoch timestamp (integer) and `limit` is the max number of
+    messages to replay (server max: 25).
 
   ## Presence
 
@@ -32,6 +36,12 @@ defmodule Supabase.Realtime.Channel do
       {:ok, channel} = MyApp.Realtime.channel("room:lobby",
         broadcast: [self: true, ack: true],
         presence: [key: "user:42"]
+      )
+
+      # With message replay on a private channel
+      {:ok, channel} = MyApp.Realtime.channel("private:room",
+        broadcast: [replay: [since: 1_700_000_000, limit: 25]],
+        private: true
       )
   """
 
@@ -110,18 +120,22 @@ defmodule Supabase.Realtime.Channel do
 
     broadcast_opts = opts[:broadcast]
     presence_opts = opts[:presence]
+    private? = opts[:private] || Map.get(config, :private, false)
 
     default_config = %{
       broadcast: %{ack: false, self: false},
       presence: %{key: ""},
-      private: false
+      private: private?
     }
 
     merged_config =
       default_config
       |> Map.merge(config)
+      |> Map.put(:private, private?)
       |> maybe_merge_broadcast(broadcast_opts)
       |> maybe_merge_presence(presence_opts)
+
+    validate_replay!(merged_config)
 
     merged_params = Map.put(params, :config, merged_config)
 
@@ -424,9 +438,38 @@ defmodule Supabase.Realtime.Channel do
   defp maybe_merge_broadcast(config, nil), do: config
 
   defp maybe_merge_broadcast(config, opts) when is_list(opts) do
-    broadcast = Map.merge(config.broadcast, Map.new(opts))
+    {replay_opts, rest_opts} = Keyword.pop(opts, :replay)
+
+    broadcast = Map.merge(config.broadcast, Map.new(rest_opts))
+
+    broadcast =
+      case replay_opts do
+        nil -> broadcast
+        replay when is_list(replay) -> Map.put(broadcast, :replay, build_replay(replay))
+        replay when is_map(replay) -> Map.put(broadcast, :replay, replay)
+      end
+
     %{config | broadcast: broadcast}
   end
+
+  defp build_replay(opts) do
+    since = Keyword.fetch!(opts, :since)
+
+    replay = %{since: since}
+
+    case Keyword.get(opts, :limit) do
+      nil -> replay
+      limit -> Map.put(replay, :limit, limit)
+    end
+  end
+
+  defp validate_replay!(%{broadcast: %{replay: _replay}, private: false}) do
+    raise ArgumentError,
+          "broadcast replay requires a private channel. " <>
+            "Set `private: true` when creating the channel."
+  end
+
+  defp validate_replay!(_config), do: :ok
 
   defp maybe_merge_presence(config, nil), do: config
 

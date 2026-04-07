@@ -52,6 +52,61 @@ defmodule Supabase.Realtime.ChannelTest do
 
       assert channel.topic == "realtime:test_topic"
     end
+
+    test "creates a private channel with replay config" do
+      channel =
+        Channel.new("private:room", self(),
+          broadcast: [replay: [since: 1_700_000_000, limit: 25]],
+          private: true
+        )
+
+      config = channel.params.config
+      assert config.private == true
+      assert config.broadcast.replay == %{since: 1_700_000_000, limit: 25}
+    end
+
+    test "creates a private channel with replay without limit" do
+      channel =
+        Channel.new("private:room", self(),
+          broadcast: [replay: [since: 1_700_000_000]],
+          private: true
+        )
+
+      config = channel.params.config
+      assert config.broadcast.replay == %{since: 1_700_000_000}
+    end
+
+    test "creates a private channel with replay and other broadcast opts" do
+      channel =
+        Channel.new("private:room", self(),
+          broadcast: [self: true, ack: true, replay: [since: 1_700_000_000]],
+          private: true
+        )
+
+      config = channel.params.config
+      assert config.private == true
+      assert config.broadcast.self == true
+      assert config.broadcast.ack == true
+      assert config.broadcast.replay == %{since: 1_700_000_000}
+    end
+
+    test "raises when replay is used on a public channel" do
+      assert_raise ArgumentError, ~r/broadcast replay requires a private channel/, fn ->
+        Channel.new("public:room", self(), broadcast: [replay: [since: 1_700_000_000]])
+      end
+    end
+
+    test "creates a private channel via params config" do
+      channel =
+        Channel.new("room", self(),
+          params: %{config: %{private: true}},
+          broadcast: [replay: [since: 1_700_000_000]]
+        )
+
+      config = channel.params.config
+      assert config.private == true
+      assert config.broadcast.replay == %{since: 1_700_000_000}
+    end
   end
 
   describe "update_state/2" do
