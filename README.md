@@ -27,7 +27,7 @@ Add `supabase_realtime` to your list of dependencies in `mix.exs`:
 def deps do
   [
     {:supabase_potion, "~> 0.7"},
-    {:supabase_realtime, "~> 0.4.0"} # x-release-please-version
+    {:supabase_realtime, "~> 0.5.0"} # x-release-please-version
   ]
 end
 ```

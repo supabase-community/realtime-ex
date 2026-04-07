@@ -2,6 +2,19 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.5.0](https://github.com/supabase-community/realtime-ex/compare/v0.4.0...v0.5.0) (2026-04-07)
+
+
+### Features
+
+* add list channels helper ([#40](https://github.com/supabase-community/realtime-ex/issues/40)) ([dcbc13d](https://github.com/supabase-community/realtime-ex/commit/dcbc13dc651aed33b72dd763292688bc31eb78c2))
+* broadcast message replay ([#39](https://github.com/supabase-community/realtime-ex/issues/39)) ([d204472](https://github.com/supabase-community/realtime-ex/commit/d20447258a6251784161281663f77fbcb409dcdf))
+
+
+### Miscellaneous Chores
+
+* remove readme warning ([d0ccebd](https://github.com/supabase-community/realtime-ex/commit/d0ccebdf823a69a2fe57f6c8d783385da3305f9a))
+
 ## [0.4.0](https://github.com/supabase-community/realtime-ex/compare/v0.3.0...v0.4.0) (2026-03-09)
 
 
