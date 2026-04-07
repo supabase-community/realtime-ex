@@ -64,6 +64,35 @@ defmodule Supabase.Realtime.Channel.RegistryTest do
     end
   end
 
+  describe "list_channels/1" do
+    test "returns empty list when no channels exist", %{registry: registry} do
+      assert [] = Registry.list_channels(registry)
+    end
+
+    test "returns all created channels", %{registry: registry} do
+      {:ok, _ch1} = Registry.create_channel(registry, "topic1")
+      {:ok, _ch2} = Registry.create_channel(registry, "topic2")
+      {:ok, _ch3} = Registry.create_channel(registry, "topic3")
+
+      channels = Registry.list_channels(registry)
+      assert length(channels) == 3
+
+      topics = channels |> Enum.map(& &1.topic) |> Enum.sort()
+      assert topics == ["realtime:topic1", "realtime:topic2", "realtime:topic3"]
+    end
+
+    test "reflects channel removals", %{registry: registry, store: store} do
+      {:ok, ch1} = Registry.create_channel(registry, "topic1")
+      {:ok, _ch2} = Registry.create_channel(registry, "topic2")
+
+      assert length(Registry.list_channels(registry)) == 2
+
+      Store.remove(store, ch1)
+
+      assert length(Registry.list_channels(registry)) == 1
+    end
+  end
+
   describe "subscribe/4" do
     test "adds binding to channel", %{registry: registry, store: store} do
       {:ok, channel} = Registry.create_channel(registry, "my_topic")

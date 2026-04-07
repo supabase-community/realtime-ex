@@ -90,6 +90,18 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   @doc """
+  Lists all active channels.
+
+  ## Parameters
+
+  * `server` - The server PID or name
+  """
+  @spec list_channels(GenServer.server()) :: [Channel.t()]
+  def list_channels(server) do
+    GenServer.call(server, :list_channels)
+  end
+
+  @doc """
   Subscribes to events on a channel.
 
   ## Parameters
@@ -156,6 +168,12 @@ defmodule Supabase.Realtime.Channel.Registry do
     }
 
     {:ok, state}
+  end
+
+  @impl true
+  def handle_call(:list_channels, _from, state) do
+    channels = Store.all(state.store)
+    {:reply, channels, state}
   end
 
   @impl true
