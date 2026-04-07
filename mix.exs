@@ -40,7 +40,7 @@ defmodule Supabase.Realtime.MixProject do
       {:gun, "~> 2.1"},
       {:mimic, "~> 1.1", only: :test},
       {:styler, "~> 1.4", only: [:dev, :test], runtime: false},
-      {:ex_doc, ">= 0.0.0", only: [:dev], runtime: false},
+      {:ex_doc, ">= 0.0.0", only: [:dev, :test], runtime: false},
       {:credo, "~> 1.7", only: [:dev, :test], runtime: false},
       {:dialyxir, "~> 1.3", only: [:dev, :test], runtime: false}
     ]
