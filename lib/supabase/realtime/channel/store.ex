@@ -11,8 +11,6 @@ defmodule Supabase.Realtime.Channel.Store do
 
   alias Supabase.Realtime.Channel
 
-  require Logger
-
   @table_name :supabase_realtime_channels
 
   # Client API
