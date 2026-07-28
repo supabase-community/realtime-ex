@@ -332,8 +332,9 @@ defmodule Supabase.Realtime.Connection do
   def handle_info(:heartbeat, state) do
     heartbeat_ref = generate_join_ref()
 
-    message = Message.heartbeat_message()
-    send_message_to_topic("phoenix", Map.put(message, :ref, heartbeat_ref), state)
+    message = Map.put(Message.heartbeat_message(), :ref, heartbeat_ref)
+
+    :ok = send_message(message, state)
     heartbeat_timer = schedule_heartbeat(state.heartbeat_interval)
 
     {:noreply, %{state | heartbeat_timer: heartbeat_timer, pending_heartbeat_ref: heartbeat_ref}}
@@ -611,11 +612,15 @@ defmodule Supabase.Realtime.Connection do
 
     Logger.debug("[#{__MODULE__}]: Sending message: #{inspect(message)}")
 
-    {:ok, encoded} = Message.encode(message)
-    :ok = :gun.ws_send(state.socket, state.stream_ref, {:text, encoded})
+    :ok = send_message(message, state)
     {:ok, _} = Store.update_join_ref(state.store, channel, message_ref)
 
     :ok
+  end
+
+  defp send_message(message, state) do
+    {:ok, encoded} = Message.encode(message)
+    :ok = :gun.ws_send(state.socket, state.stream_ref, {:text, encoded})
   end
 
   defp ensure_latest_channel(channel, state) do

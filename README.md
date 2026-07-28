@@ -5,6 +5,10 @@
 
 Elixir client for Supabase Realtime. Provides OTP-powered connectivity for real-time database changes, broadcast messages, and presence features.
 
+## Compatibility
+
+We support the latest 3 stable Elixir versions.
+
 ## Features
 
 - **OTP Supervision**: Resilient connections with automatic recovery
