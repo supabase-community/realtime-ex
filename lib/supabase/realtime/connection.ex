@@ -58,6 +58,7 @@ defmodule Supabase.Realtime.Connection do
   alias Supabase.Realtime.Channel
   alias Supabase.Realtime.Channel.Store
   alias Supabase.Realtime.Message
+  alias Supabase.Realtime.Serializer
 
   require Logger
 
@@ -86,7 +87,10 @@ defmodule Supabase.Realtime.Connection do
           access_token: String.t() | nil,
           access_token_fn: (-> {:ok, String.t()} | {:error, term()}) | {module(), atom(), list()} | nil,
           tls_opts: keyword() | nil,
-          custom_params: map()
+          custom_params: map(),
+          serializer: module(),
+          vsn: String.t(),
+          serializer_opts: keyword()
         }
 
   # Client API
@@ -103,6 +107,13 @@ defmodule Supabase.Realtime.Connection do
   * `:reconnect_after_ms` - Function that returns reconnection delay based on attempts
   * `:tls_opts` - Keyword list merged over the default TLS options (which
     verify the peer certificate against the OS trust store)
+  * `:vsn` - Realtime protocol version negotiated in the websocket query
+    string ("1.0.0" default, "2.0.0" for array JSON + binary framing)
+  * `:serializer` - Module implementing `Supabase.Realtime.Serializer`;
+    overrides the vsn-derived default, and you own matching it to the wire
+    format the server negotiates for the given vsn
+  * `:serializer_opts` - Keyword list forwarded to every serializer
+    encode/decode call
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -214,6 +225,12 @@ defmodule Supabase.Realtime.Connection do
     heartbeat_interval = opts[:heartbeat_interval] || to_timeout(second: 25)
     reconnect_function = opts[:reconnect_after_ms] || (&default_reconnect_after_ms/1)
 
+    {serializer, vsn} =
+      case Serializer.resolve(opts) do
+        {:ok, serializer, vsn} -> {serializer, vsn}
+        {:error, reason} -> raise ArgumentError, "invalid Realtime serializer options: #{inspect(reason)}"
+      end
+
     state = %{
       client: client,
       registry: registry,
@@ -234,7 +251,10 @@ defmodule Supabase.Realtime.Connection do
       access_token: nil,
       access_token_fn: opts[:access_token_fn],
       tls_opts: opts[:tls_opts],
-      custom_params: opts[:params] || %{}
+      custom_params: opts[:params] || %{},
+      serializer: serializer,
+      vsn: vsn,
+      serializer_opts: opts[:serializer_opts] || []
     }
 
     {:ok, state, {:continue, :connect}}
@@ -256,7 +276,7 @@ defmodule Supabase.Realtime.Connection do
 
   def handle_continue(:upgrade, %{socket: socket} = state) do
     token = resolve_access_token(state)
-    uri = build_url(state.client, state.custom_params)
+    uri = build_url(state.client, state)
     path = uri.path <> if(uri.query == "", do: "", else: "?" <> uri.query)
 
     headers = [
@@ -327,7 +347,7 @@ defmodule Supabase.Realtime.Connection do
           |> Map.put(:ref, join_ref)
           |> Map.put(:join_ref, join_ref)
 
-        :ok = send_message(message, state)
+        send_message(message, state)
         {:ok, _updated} = Store.update_join_ref(state.store, channel, join_ref)
 
         {:reply, :ok, state}
@@ -352,7 +372,7 @@ defmodule Supabase.Realtime.Connection do
           |> Map.put(:ref, leave_ref)
           |> Map.put(:join_ref, channel.join_ref)
 
-        :ok = send_message(message, state)
+        send_message(message, state)
         {:ok, _updated} = Store.update_leave_ref(state.store, channel, leave_ref)
 
         {:reply, :ok, state}
@@ -374,7 +394,7 @@ defmodule Supabase.Realtime.Connection do
     if state.status == :open do
       for channel <- Store.all(state.store), Channel.joined?(channel) do
         message = Message.access_token_message(channel, token)
-        :ok = send_message_to_topic(channel, message, state)
+        send_message_to_topic(channel, message, state)
       end
     end
 
@@ -415,14 +435,11 @@ defmodule Supabase.Realtime.Connection do
   end
 
   def handle_info({:gun_ws, socket, stream, {:text, data}}, %{socket: socket, stream_ref: stream} = state) do
-    case Message.decode(data) do
-      {:ok, message} ->
-        handle_ws_message(message, state)
+    decode_frame({:text, data}, state)
+  end
 
-      {:error, reason} ->
-        Logger.error("[#{__MODULE__}]: Failed to decode message: #{inspect(reason)}")
-        {:noreply, state}
-    end
+  def handle_info({:gun_ws, socket, stream, {:binary, data}}, %{socket: socket, stream_ref: stream} = state) do
+    decode_frame({:binary, data}, state)
   end
 
   def handle_info({:gun_ws, socket, _stream, {:close, code, _reason}}, %{socket: socket} = state) do
@@ -446,7 +463,7 @@ defmodule Supabase.Realtime.Connection do
 
       message = Map.put(Message.heartbeat_message(), :ref, heartbeat_ref)
 
-      :ok = send_message(message, state)
+      send_message(message, state)
 
       {:noreply,
        %{
@@ -504,7 +521,7 @@ defmodule Supabase.Realtime.Connection do
   end
 
   def handle_info({:gun_ws, _socket, _stream, {:binary, _data}}, state) do
-    Logger.warning("[#{__MODULE__}]: Ignoring binary websocket frame (vsn 1.0.0 is text-only)")
+    Logger.debug("[#{__MODULE__}]: Ignoring stale websocket binary frame")
     {:noreply, state}
   end
 
@@ -691,7 +708,7 @@ defmodule Supabase.Realtime.Connection do
 
   defp connect(state) do
     client = state.client
-    uri = build_url(client, state.custom_params)
+    uri = build_url(client, state)
 
     host = String.to_charlist(uri.host)
     port = uri.port || if uri.scheme == "wss", do: 443, else: 80
@@ -743,9 +760,15 @@ defmodule Supabase.Realtime.Connection do
     )
   end
 
-  defp build_url(%Supabase.Client{} = client, custom_params) do
-    base_params = %{apikey: client.api_key, vsn: "1.0.0"}
-    query = base_params |> Map.merge(custom_params) |> URI.encode_query()
+  # the negotiated vsn is written after the custom params merge so it is
+  # authoritative: a user vsn in :params can no longer desync the wire format
+  # from the serializer
+  defp build_url(%Supabase.Client{} = client, state) do
+    query =
+      %{apikey: client.api_key}
+      |> Map.merge(state.custom_params)
+      |> Map.put(:vsn, state.vsn)
+      |> URI.encode_query()
 
     client.realtime_url
     |> URI.new!()
@@ -769,6 +792,19 @@ defmodule Supabase.Realtime.Connection do
   @default_reconnect_fallback 10_000
 
   defp default_reconnect_after_ms(tries), do: Enum.at(@reconnect_intervals, tries - 1, @default_reconnect_fallback)
+
+  # Both frame opcodes route through the negotiated serializer; decode
+  # failures are logged and dropped (the Registry never sees a bad frame).
+  defp decode_frame(frame, state) do
+    case state.serializer.decode(frame, state.serializer_opts) do
+      {:ok, message} ->
+        handle_ws_message(message, state)
+
+      {:error, reason} ->
+        Logger.error("[#{__MODULE__}]: failed to decode frame: #{inspect(reason)}")
+        {:noreply, state}
+    end
+  end
 
   defp handle_ws_message(
          %{"topic" => "phoenix", "event" => "phx_reply", "ref" => ref},
@@ -832,15 +868,23 @@ defmodule Supabase.Realtime.Connection do
 
     Logger.debug("[#{__MODULE__}]: Sending message: #{inspect(message)}")
 
-    :ok = send_message(message, state)
-    # join_ref is written only by join_channel/2
-
-    :ok
+    send_message(message, state)
   end
 
+  # Encode failures are log-and-drop: they are programming or configuration
+  # errors (unencodable payload, oversized field), not transient conditions a
+  # caller could retry, so call replies keep their :ok contract.
   defp send_message(message, state) do
-    {:ok, encoded} = Message.encode(message)
-    :ok = :gun.ws_send(state.socket, state.stream_ref, {:text, encoded})
+    case state.serializer.encode(message, state.serializer_opts) do
+      {:ok, frame} ->
+        :ok = :gun.ws_send(state.socket, state.stream_ref, frame)
+        :ok
+
+      {:error, reason} ->
+        Logger.error("[#{__MODULE__}]: failed to encode message on topic #{message.topic}: #{inspect(reason)}")
+
+        {:error, reason}
+    end
   end
 
   defp ensure_latest_channel(channel, state) do

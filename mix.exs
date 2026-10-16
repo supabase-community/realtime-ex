@@ -70,6 +70,11 @@ defmodule Supabase.Realtime.MixProject do
           Supabase.Realtime.Channel.Registry,
           Supabase.Realtime.Channel.Store
         ],
+        Serializers: [
+          Supabase.Realtime.Serializer,
+          Supabase.Realtime.Serializer.V1,
+          Supabase.Realtime.Serializer.V2
+        ],
         Utilities: [
           Supabase.Realtime.HTTP,
           Supabase.Realtime.Message,

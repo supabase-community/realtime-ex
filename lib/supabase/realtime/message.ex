@@ -2,15 +2,18 @@ defmodule Supabase.Realtime.Message do
   @moduledoc """
   Message encoding and decoding for Supabase Realtime.
 
-  This module handles serialization and deserialization of the WebSocket messages
-  exchanged with the Supabase Realtime service.
+  Builders for the Realtime wire messages plus vsn 1.0.0 JSON helpers
+  (`encode/1` and `decode/1`); the Connection itself serializes through the
+  negotiated serializer (`Supabase.Realtime.Serializer`).
   """
 
   alias Supabase.Realtime
   alias Supabase.Realtime.Channel
+  alias Supabase.Realtime.Serializer
 
   @doc """
-  Encodes a message for sending to the Supabase Realtime server.
+  Encodes a message for sending to the Supabase Realtime server, as a vsn
+  1.0.0 JSON text frame payload.
 
   ## Parameters
 
@@ -18,27 +21,22 @@ defmodule Supabase.Realtime.Message do
 
   ## Returns
 
-  * `binary` - JSON-encoded message
+  * `{:ok, binary}` - JSON-encoded message
+  * `{:error, term}` - Error information
 
   ## Examples
 
-      iex> Message.encode(%{topic: "realtime:public", event: "INSERT", payload: %{}, ref: "1"})
-      "{\"topic\":\"realtime:public\",\"event\":\"INSERT\",\"payload\":{},\"ref\":\"1\"}"
+      iex> Supabase.Realtime.Message.encode(%{topic: "realtime:public", event: "INSERT", payload: %{}, ref: "1"})
+      {:ok, "{\\"topic\\":\\"realtime:public\\",\\"event\\":\\"INSERT\\",\\"payload\\":{},\\"ref\\":\\"1\\"}"}
   """
   @spec encode(Realtime.realtime_message() | map()) :: {:ok, binary} | {:error, term}
-  def encode(message), do: encode_json(message)
-
-  # Native JSON has no tuple-returning encode/1, so the bang function is
-  # wrapped once here at the wire boundary. Callers keep the
-  # {:ok, _} | {:error, _} contract.
-  defp encode_json(term) do
-    {:ok, JSON.encode!(term)}
-  rescue
-    e -> {:error, {:encode_failed, e}}
+  def encode(message) do
+    with {:ok, {:text, json}} <- Serializer.V1.encode(message, []), do: {:ok, json}
   end
 
   @doc """
-  Decodes a message received from the Supabase Realtime server.
+  Decodes a message received from the Supabase Realtime server, as a vsn
+  1.0.0 JSON text frame payload.
 
   ## Parameters
 
@@ -51,11 +49,11 @@ defmodule Supabase.Realtime.Message do
 
   ## Examples
 
-      iex> Message.decode("{\"topic\":\"realtime:public\",\"event\":\"INSERT\",\"payload\":{},\"ref\":\"1\"}")
+      iex> Supabase.Realtime.Message.decode("{\\"topic\\":\\"realtime:public\\",\\"event\\":\\"INSERT\\",\\"payload\\":{},\\"ref\\":\\"1\\"}")
       {:ok, %{"topic" => "realtime:public", "event" => "INSERT", "payload" => %{}, "ref" => "1"}}
   """
   @spec decode(binary()) :: {:ok, map()} | {:error, term()}
-  def decode(data) when is_binary(data), do: JSON.decode(data)
+  def decode(data) when is_binary(data), do: Serializer.V1.decode({:text, data}, [])
 
   @doc """
   Constructs a subscription message for a channel.

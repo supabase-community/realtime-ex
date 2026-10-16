@@ -1,3 +1,31 @@
+defmodule ConnectionFakeSerializer do
+  @moduledoc false
+  @behaviour Supabase.Realtime.Serializer
+
+  @collector_key {__MODULE__, :collector_pid}
+
+  def set_collector(pid), do: :persistent_term.put(@collector_key, pid)
+
+  @impl true
+  def encode(message, opts) do
+    record({:encode, message, opts})
+    {:ok, {:text, "fake-encode"}}
+  end
+
+  @impl true
+  def decode(frame, opts) do
+    record({:decode, frame, opts})
+    {:ok, %{"topic" => "fake", "event" => "fake", "payload" => %{}, "ref" => nil}}
+  end
+
+  defp record(call) do
+    case :persistent_term.get(@collector_key, nil) do
+      nil -> :ok
+      pid -> send(pid, {:fake_serializer, call})
+    end
+  end
+end
+
 defmodule Supabase.Realtime.ConnectionTest do
   # Using async: false as we're mocking global modules
   use ExUnit.Case, async: false
@@ -8,6 +36,7 @@ defmodule Supabase.Realtime.ConnectionTest do
   alias Supabase.Realtime.Channel.Registry
   alias Supabase.Realtime.Channel.Store
   alias Supabase.Realtime.Connection
+  alias Supabase.Realtime.Message
 
   @moduletag capture_log: true
 
@@ -498,6 +527,301 @@ defmodule Supabase.Realtime.ConnectionTest do
       state = :sys.get_state(pid)
       assert state.status == :closed
       assert is_reference(state.reconnect_timer)
+    end
+  end
+
+  describe "serializer resolution" do
+    test "init defaults to the V1 serializer with vsn 1.0.0", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
+      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+
+      pid =
+        start_supervised!({Connection, name: conn_name, registry: registry, store: store, client: @mock_client})
+
+      Process.sleep(30)
+
+      state = :sys.get_state(pid)
+      assert state.serializer == Supabase.Realtime.Serializer.V1
+      assert state.vsn == "1.0.0"
+      assert state.serializer_opts == []
+    end
+
+    test "init with vsn 2.0.0 selects the V2 serializer", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
+      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+
+      opts = [name: conn_name, registry: registry, store: store, client: @mock_client, vsn: "2.0.0"]
+      pid = start_supervised!({Connection, opts})
+      Process.sleep(30)
+
+      state = :sys.get_state(pid)
+      assert state.serializer == Supabase.Realtime.Serializer.V2
+      assert state.vsn == "2.0.0"
+    end
+
+    test "init with an unsupported vsn fails to start", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      opts = [name: conn_name, registry: registry, store: store, client: @mock_client, vsn: "9.9.9"]
+
+      # trapping keeps the linked failing start from killing the test process,
+      # so the failure surfaces as a start error carrying the exception
+      Process.flag(:trap_exit, true)
+
+      assert {:error, {%ArgumentError{message: message}, _stack}} = Connection.start_link(opts)
+      assert message =~ "invalid Realtime serializer options"
+    end
+
+    test "serializer_opts are stored verbatim", %{registry: registry, store: store, conn_name: conn_name} do
+      stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
+      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+
+      opts = [
+        name: conn_name,
+        registry: registry,
+        store: store,
+        client: @mock_client,
+        vsn: "2.0.0",
+        serializer_opts: [allowed_metadata_keys: [:user_id]]
+      ]
+
+      pid = start_supervised!({Connection, opts})
+      Process.sleep(30)
+
+      assert :sys.get_state(pid).serializer_opts == [allowed_metadata_keys: [:user_id]]
+    end
+  end
+
+  describe "URL negotiation" do
+    defp capture_upgrade_path(opts) do
+      test = self()
+
+      stub(:gun, :open, fn _, _, _ -> {:ok, test} end)
+
+      stub(:gun, :ws_upgrade, fn _socket, path, _headers ->
+        send(test, {:upgrade_path, path})
+        make_ref()
+      end)
+
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+
+      pid = start_supervised!({Connection, opts})
+      send(pid, {:gun_up, test, :http})
+      assert_receive {:upgrade_path, path}, 1000
+      path
+    end
+
+    test "default negotiation stays at vsn 1.0.0", %{registry: registry, store: store, conn_name: conn_name} do
+      path =
+        capture_upgrade_path(name: conn_name, registry: registry, store: store, client: @mock_client)
+
+      assert path =~ "vsn=1.0.0"
+    end
+
+    test "the negotiated vsn travels in the query string", %{registry: registry, store: store, conn_name: conn_name} do
+      path =
+        capture_upgrade_path(name: conn_name, registry: registry, store: store, client: @mock_client, vsn: "2.0.0")
+
+      assert path =~ "vsn=2.0.0"
+    end
+
+    test "the negotiated vsn wins over a vsn inside params", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      path =
+        capture_upgrade_path(
+          name: conn_name,
+          registry: registry,
+          store: store,
+          client: @mock_client,
+          vsn: "2.0.0",
+          params: %{vsn: "9.9.9"}
+        )
+
+      assert path =~ "vsn=2.0.0"
+      refute path =~ "9.9.9"
+    end
+  end
+
+  describe "serializer wiring" do
+    defp start_open_connection(ctx, extra_opts, frames_pid) do
+      stub(:gun, :open, fn _, _, _ -> {:ok, frames_pid} end)
+      stream_ref = make_ref()
+      stub(:gun, :ws_upgrade, fn _, _, _ -> stream_ref end)
+
+      stub(:gun, :ws_send, fn _socket, _stream, frame ->
+        send(frames_pid, {:ws_frame, frame})
+        :ok
+      end)
+
+      stub(:gun, :close, fn _socket -> :ok end)
+
+      conn =
+        start_supervised!(
+          {Connection,
+           [name: ctx.conn_name, registry: ctx.registry, store: ctx.store, client: @mock_client] ++ extra_opts}
+        )
+
+      send(conn, {:gun_up, frames_pid, :http})
+      send(conn, {:gun_upgrade, frames_pid, stream_ref, ["websocket"], []})
+      Process.sleep(30)
+
+      {conn, stream_ref}
+    end
+
+    test "V2 sends user broadcasts as kind-3 binary frames", ctx do
+      {conn, _stream_ref} = start_open_connection(ctx, [vsn: "2.0.0"], self())
+      {:ok, channel} = Registry.create_channel(ctx.registry, "sala")
+      {:ok, _updated} = Store.update_join_ref(ctx.store, channel, "7")
+
+      payload = %{type: "broadcast", event: "posição", payload: %{x: 1, y: 2}}
+
+      :ok =
+        Connection.send_message(conn, channel, %{event: "broadcast", payload: payload, ref: "42"})
+
+      expected =
+        <<3, 1, 2, 13, 9, 0, 1>> <>
+          "7" <>
+          "42" <>
+          "realtime:sala" <>
+          "posição" <>
+          "" <>
+          ~s({"x":1,"y":2})
+
+      assert_received {:ws_frame, {:binary, ^expected}}
+    end
+
+    test "V2 sends non-broadcast messages as JSON array text frames", ctx do
+      {conn, _stream_ref} = start_open_connection(ctx, [vsn: "2.0.0"], self())
+
+      send(conn, :heartbeat)
+
+      assert_receive {:ws_frame, {:text, json}}, 1000
+      assert [nil, ref, "phoenix", "heartbeat", %{}] = JSON.decode!(json)
+      assert ref =~ ~r/^msg:[0-9a-f]{20}$/
+    end
+
+    test "V1 keeps sending object JSON text frames (no-regression gate)", ctx do
+      {conn, _stream_ref} = start_open_connection(ctx, [], self())
+      {:ok, channel} = Registry.create_channel(ctx.registry, "room")
+
+      :ok = Connection.send_message(conn, channel, Message.broadcast_message(channel, "ev", %{n: 1}))
+
+      assert_receive {:ws_frame, {:text, broadcast_json}}, 1000
+      broadcast = JSON.decode!(broadcast_json)
+      assert is_map(broadcast)
+      assert broadcast["event"] == "broadcast"
+      assert broadcast["topic"] == "realtime:room"
+      assert broadcast["payload"] == %{"type" => "broadcast", "event" => "ev", "payload" => %{"n" => 1}}
+
+      send(conn, :heartbeat)
+
+      assert_receive {:ws_frame, {:text, heartbeat_json}}, 1000
+      heartbeat = JSON.decode!(heartbeat_json)
+      assert is_map(heartbeat)
+      assert heartbeat["topic"] == "phoenix"
+      assert heartbeat["event"] == "heartbeat"
+    end
+
+    test "inbound binary frames decode through V2 and reach the Registry", ctx do
+      on_exit(fn -> RealtimeTest.clear_collector() end)
+
+      {conn, stream_ref} = start_open_connection(ctx, [vsn: "2.0.0"], self())
+      {:ok, channel} = Registry.create_channel(ctx.registry, "sala")
+      :ok = Registry.subscribe(ctx.registry, channel, "broadcast", %{event: "posição"})
+      RealtimeTest.set_collector(self())
+
+      frame = <<4, 13, 9, 0, 1>> <> "realtime:sala" <> "posição" <> "" <> ~s({"x":1,"y":2})
+      send(conn, {:gun_ws, self(), stream_ref, {:binary, frame}})
+
+      assert_receive {:dispatched, {:broadcast, "posição", %{"x" => 1, "y" => 2}}}, 1000
+    end
+
+    test "inbound binary frames are logged and dropped under V1", ctx do
+      on_exit(fn -> RealtimeTest.clear_collector() end)
+
+      {conn, stream_ref} = start_open_connection(ctx, [], self())
+      RealtimeTest.set_collector(self())
+
+      frame = <<4, 13, 9, 0, 1>> <> "realtime:sala" <> "posição" <> "" <> ~s({"x":1,"y":2})
+
+      log =
+        capture_log(fn ->
+          send(conn, {:gun_ws, self(), stream_ref, {:binary, frame}})
+          Process.sleep(50)
+        end)
+
+      assert log =~ "failed to decode frame"
+      refute_received {:dispatched, _}
+      assert Process.alive?(conn)
+    end
+
+    test "encode failures are logged and dropped without poisoning the connection", ctx do
+      {conn, _stream_ref} = start_open_connection(ctx, [vsn: "2.0.0"], self())
+
+      # a 250-char name gives a 259-byte topic, over the 255-byte field guard
+      {:ok, channel} = Registry.create_channel(ctx.registry, String.duplicate("a", 250))
+
+      payload = %{event: "broadcast", payload: %{event: "ev", payload: %{}}}
+
+      log =
+        capture_log(fn ->
+          assert :ok = Connection.send_message(conn, channel, payload)
+        end)
+
+      assert log =~ "failed to encode message"
+      assert log =~ "{:field_too_long, :topic, 259}"
+      assert Process.alive?(conn)
+
+      # a well-formed message still goes out afterwards
+      send(conn, :heartbeat)
+      assert_receive {:ws_frame, {:text, _json}}, 1000
+    end
+
+    test "junk binary frames are logged and dropped without poisoning the connection", ctx do
+      {conn, stream_ref} = start_open_connection(ctx, [vsn: "2.0.0"], self())
+
+      log =
+        capture_log(fn ->
+          send(conn, {:gun_ws, self(), stream_ref, {:binary, <<255, 1, 2>>}})
+          Process.sleep(50)
+        end)
+
+      assert log =~ "failed to decode frame"
+      assert Process.alive?(conn)
+    end
+
+    test "custom serializer option flows to encode/decode with serializer_opts", ctx do
+      on_exit(fn -> ConnectionFakeSerializer.set_collector(nil) end)
+      ConnectionFakeSerializer.set_collector(self())
+
+      opts = [serializer: ConnectionFakeSerializer, serializer_opts: [custom: :opt]]
+      {conn, stream_ref} = start_open_connection(ctx, opts, self())
+      {:ok, channel} = Registry.create_channel(ctx.registry, "sala")
+
+      :ok = Connection.send_message(conn, channel, %{event: "e", payload: %{}})
+
+      assert_receive {:fake_serializer, {:encode, message, [custom: :opt]}}, 1000
+      assert message[:topic] == "realtime:sala"
+      assert_receive {:ws_frame, {:text, "fake-encode"}}, 1000
+
+      send(conn, {:gun_ws, self(), stream_ref, {:text, "raw-inbound"}})
+      assert_receive {:fake_serializer, {:decode, {:text, "raw-inbound"}, [custom: :opt]}}, 1000
     end
   end
 
