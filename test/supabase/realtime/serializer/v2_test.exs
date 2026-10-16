@@ -281,14 +281,12 @@ defmodule Supabase.Realtime.Serializer.V2Test do
     {:ok, {:binary, encoded}} = V2.encode(@worked_message, [])
 
     # the server rebuilds the fields into a kind-4 frame (metadata empty)
-    <<3, _join_ref_size, _ref_size, topic_size, user_event_size, metadata_size, 1, _join_ref::binary-size(_join_ref_size),
-      _ref::binary-size(_ref_size), topic::binary-size(topic_size), user_event::binary-size(user_event_size),
-      metadata::binary-size(metadata_size), user_payload::binary>> =
-      encoded
+    <<3, jr, rf, ts, es, ms, 1, _join_ref::binary-size(jr), _ref::binary-size(rf), topic::binary-size(ts),
+      user_event::binary-size(es), metadata::binary-size(ms), user_payload::binary>> = encoded
 
-    assert metadata_size == 0
+    assert ms == 0
 
-    server_frame = <<4, topic_size, user_event_size, metadata_size, 1>> <> topic <> user_event <> metadata <> user_payload
+    server_frame = <<4, ts, es, ms, 1>> <> topic <> user_event <> metadata <> user_payload
 
     assert {:ok,
             %{
