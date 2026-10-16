@@ -141,6 +141,12 @@ Set a custom presence key:
 {:ok, channel} = MyApp.Realtime.channel("room:lobby", presence: [key: "user_123"])
 ```
 
+The full presence state (what `{:presence, :sync, state}` receives) mirrors
+the server's map exactly: keys are presence keys, each entry holds a
+`metas` list. Multiple devices per key are supported: joins/leaves merge
+per `phx_ref` instead of replacing the whole key, so a second device
+joining adds its meta next to the first one's.
+
 ## Postgres Changes
 
 Subscribe to database changes:
@@ -163,7 +169,60 @@ Subscribe to database changes:
   event: :update, schema: "public", table: "messages",
   filter: "room_id=eq.42"
 )
+
+# With a typed filter builder and a column select list
+alias Supabase.Realtime.Filter
+
+:ok = MyApp.Realtime.on(channel, "postgres_changes",
+  event: :update, schema: "public", table: "messages",
+  filter: Filter.new() |> Filter.eq("room_id", 42) |> Filter.lt("age", 30),
+  select: ["id", "body"]
+)
 ```
+
+### Filter Builder
+
+`Supabase.Realtime.Filter` builds the postgres_changes `filter` string with
+PostgREST operator syntax and quoting:
+
+```elixir
+alias Supabase.Realtime.Filter
+
+Filter.new() |> Filter.eq("id", 1) |> Filter.lt("age", 30) |> Filter.build()
+#=> "id=eq.1,age=lt.30"
+
+Filter.within("status", ["active", "pending"])
+#=> status=in.(active,pending)
+
+Filter.negate("deleted_at", :is, nil)
+#=> deleted_at=not.is.null
+```
+
+Values containing reserved characters (`,` `(` `)` `"` `\`) or surrounding
+whitespace are double-quoted and escaped the way PostgREST does
+(`"a,b"`), so they survive the server's filter parser; all other values are
+sent verbatim. Invalid input raises at build time (it is an authoring-time
+error, not a runtime failure): `within/3` requires a non-empty list of
+scalars, `is/3` only accepts `nil`, booleans and the `"null" | "true" |
+"false" | "unknown"` keywords, and `negate/4` raises for unknown operators.
+
+Pass the struct directly as the `:filter` value of `on/3`; it is serialized
+automatically.
+
+### Column Select
+
+The optional `:select` list restricts the columns the server sends back in
+the change payload's `record`:
+
+```elixir
+:ok = MyApp.Realtime.on(channel, "postgres_changes",
+  event: :insert, schema: "public", table: "messages",
+  select: ["id", "body"]
+)
+```
+
+It must be a non-empty list of column names, otherwise `on/3` returns
+`{:error, :invalid_select}`.
 
 Handle the events:
 
@@ -197,6 +256,24 @@ def handle_event({:connection, :state_change, %{old: old, new: new}}) do
   IO.puts("Connection changed from #{old} to #{new}")
   :ok
 end
+```
+
+## Heartbeat Telemetry
+
+The connection emits `[:supabase, :realtime, :heartbeat]` telemetry events:
+`:sent` when a heartbeat goes out, `:ok` (with a `latency` measurement in
+milliseconds) when the server replies, and `:timeout` when a heartbeat went
+unanswered by the next tick. `latency` is present only on `:ok`; metadata
+carries `status`, the heartbeat `ref` and the client `base_url`:
+
+```elixir
+:telemetry.attach("my-heartbeat", [:supabase, :realtime, :heartbeat], fn _e, m, md, _c ->
+  case md.status do
+    :sent -> :ok
+    :ok -> MyApp.Metrics.observe("realtime.heartbeat.latency", m.latency)
+    :timeout -> MyApp.Metrics.increment("realtime.heartbeat.timeouts")
+  end
+end, nil)
 ```
 
 ## Token Refresh

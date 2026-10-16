@@ -38,6 +38,7 @@ defmodule Supabase.Realtime.Channel.Registry do
   alias Supabase.Realtime.Channel.Store
   alias Supabase.Realtime.Connection
   alias Supabase.Realtime.PostgresTypes
+  alias Supabase.Realtime.Presence
 
   require Logger
 
@@ -110,6 +111,11 @@ defmodule Supabase.Realtime.Channel.Registry do
   join payload, so they cannot be added after the join started). Broadcast
   bindings are allowed at any time.
 
+  For `postgres_changes` bindings, the `:filter` value may be a
+  `%Supabase.Realtime.Filter{}` struct (serialized here) and the `:select`
+  option must be a non-empty list of column names, else the call returns
+  `{:error, :invalid_select}`.
+
   ## Parameters
 
   * `server` - The server PID or name
@@ -118,7 +124,7 @@ defmodule Supabase.Realtime.Channel.Registry do
   * `filter` - The event filter
   """
   @spec subscribe(GenServer.server(), Channel.t(), String.t(), map() | keyword()) ::
-          :ok | {:error, :channel_not_found | :already_joined | :already_joining}
+          :ok | {:error, :channel_not_found | :already_joined | :already_joining | :invalid_select}
   def subscribe(server, %Channel{} = channel, type, filter) do
     GenServer.call(server, {:subscribe, channel, type, filter})
   end
@@ -206,14 +212,7 @@ defmodule Supabase.Realtime.Channel.Registry do
         {:reply, {:error, error}, state}
 
       {:ok, found} ->
-        {:ok, updated} = Store.add_binding(state.store, found, type, filter)
-
-        if updated.state in [:closed, :errored] do
-          {:reply, :ok, state, {:continue, {:join, updated}}}
-        else
-          # broadcast bindings on a joining/joined channel
-          {:reply, :ok, state}
-        end
+        subscribe_binding(found, type, filter, state)
 
       {:error, :not_found} ->
         {:reply, {:error, :channel_not_found}, state}
@@ -239,6 +238,25 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   def handle_call(:get_presence_state, _from, state) do
     {:reply, state.presence_state, state}
+  end
+
+  # normalize before store: an invalid filter is replied as an error without
+  # being stored
+  defp subscribe_binding(found, type, filter, state) do
+    case Channel.normalize_filter(type, filter) do
+      {:ok, filter} ->
+        {:ok, updated} = Store.add_binding(state.store, found, type, filter)
+
+        if updated.state in [:closed, :errored] do
+          {:reply, :ok, state, {:continue, {:join, updated}}}
+        else
+          # broadcast bindings on a joining/joined channel
+          {:reply, :ok, state}
+        end
+
+      {:error, :invalid_select} ->
+        {:reply, {:error, :invalid_select}, state}
+    end
   end
 
   @impl true
@@ -464,8 +482,9 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   defp handle_presence_state(channels, payload, state) do
-    new_state = %{state | presence_state: Map.get(payload, "state", %{})}
-    dispatch_event(new_state, channels, {:presence, :sync, new_state.presence_state})
+    # bug 20: the server sends the state map DIRECTLY as the payload
+    new_state = %{state | presence_state: payload}
+    dispatch_event(new_state, channels, {:presence, :sync, payload})
     {:noreply, new_state}
   end
 
@@ -473,11 +492,8 @@ defmodule Supabase.Realtime.Channel.Registry do
     joins = Map.get(payload, "joins", %{})
     leaves = Map.get(payload, "leaves", %{})
 
-    # Update presence state
-    new_state =
-      state
-      |> add_presence_joins(joins)
-      |> remove_presence_leaves(leaves)
+    # bug 21: per-phx_ref merge instead of per-key clobber
+    new_state = %{state | presence_state: Presence.sync_diff(state.presence_state, payload)}
 
     # Dispatch joins/leaves events if present
     if map_size(joins) != 0,
@@ -529,7 +545,6 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   defp maybe_update_binding_ids(_channel, _payload, _state), do: :ok
 
-  # Helper to dispatch events to the callback module if available
   # Wire-event dispatch. One function head per event keeps each clause's
   # cyclomatic complexity flat as the event table grows.
   defp dispatch_message("phx_close", msg, state), do: handle_phx_close(msg_topic(msg), state)
@@ -564,35 +579,18 @@ defmodule Supabase.Realtime.Channel.Registry do
   defp msg_payload(msg), do: Map.get(msg, "payload", %{})
   defp topic_channels(msg, state), do: Store.find_all_by_topic(state.store, msg_topic(msg))
 
-  defp dispatch_event(state, channels, event) do
-    if channels != [] and function_exported?(state.module, :handle_event, 1) do
+  # Helper to dispatch events to the callback module if available. Zero
+  # matching channels is a normal no-op, not a missing callback; the warning
+  # stays for the genuinely-missing-callback case with channels present.
+  defp dispatch_event(_state, [], _event), do: :ok
+
+  defp dispatch_event(state, _channels, event) do
+    if function_exported?(state.module, :handle_event, 1) do
       Task.start(fn ->
         :ok = state.module.handle_event(event)
       end)
     else
       Logger.warning("No handle_event/1 callback defined in #{state.module}")
     end
-  end
-
-  # Helper to add presences (joins)
-  defp add_presence_joins(state, joins) do
-    presences =
-      Enum.reduce(joins, state.presence_state, fn {key, presence}, acc ->
-        Map.put(acc, key, presence)
-      end)
-
-    %{state | presence_state: presences}
-  end
-
-  # Helper to remove presences (leaves)
-  defp remove_presence_leaves(state, leaves) do
-    presences =
-      leaves
-      |> Map.keys()
-      |> Enum.reduce(state.presence_state, fn key, acc ->
-        Map.delete(acc, key)
-      end)
-
-    %{state | presence_state: presences}
   end
 end

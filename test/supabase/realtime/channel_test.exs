@@ -2,6 +2,7 @@ defmodule Supabase.Realtime.ChannelTest do
   use ExUnit.Case, async: true
 
   alias Supabase.Realtime.Channel
+  alias Supabase.Realtime.Filter
 
   describe "new/3" do
     test "creates a new channel with default options" do
@@ -336,6 +337,83 @@ defmodule Supabase.Realtime.ChannelTest do
       assert Channel.can_push?(Channel.update_state(channel, :leaving)) == false
       assert Channel.can_push?(Channel.update_state(channel, :closed)) == false
       assert Channel.can_push?(Channel.update_state(channel, :errored)) == false
+    end
+  end
+
+  describe "private?/1" do
+    test "C1: false by default" do
+      refute Channel.private?(Channel.new("room", self()))
+    end
+
+    test "C1: true when created with private: true (opts path)" do
+      assert Channel.private?(Channel.new("room", self(), private: true))
+    end
+
+    test "C1: true when created with params config private (params path)" do
+      channel = Channel.new("room", self(), params: %{config: %{private: true}})
+      assert Channel.private?(channel)
+    end
+  end
+
+  describe "normalize_filter/2" do
+    test "C2: converts keyword lists to maps" do
+      assert Channel.normalize_filter("postgres_changes", event: "INSERT", schema: "public") ==
+               {:ok, %{event: "INSERT", schema: "public"}}
+    end
+
+    test "C2: normalizes event :all to *" do
+      assert Channel.normalize_filter("postgres_changes", %{event: :all, schema: "public"}) ==
+               {:ok, %{event: "*", schema: "public"}}
+    end
+
+    test "C2: serializes a %Filter{} given as :filter" do
+      filter =
+        Filter.new()
+        |> Filter.eq("id", 1)
+        |> Filter.lt("age", 30)
+
+      assert Channel.normalize_filter("postgres_changes", %{
+               event: "UPDATE",
+               schema: "public",
+               table: "users",
+               filter: filter
+             }) ==
+               {:ok, %{event: "UPDATE", schema: "public", table: "users", filter: "id=eq.1,age=lt.30"}}
+    end
+
+    test "C2: valid select passes through" do
+      assert Channel.normalize_filter("postgres_changes", %{
+               event: "*",
+               schema: "public",
+               table: "users",
+               select: ["id", "first_name"]
+             }) ==
+               {:ok, %{event: "*", schema: "public", table: "users", select: ["id", "first_name"]}}
+    end
+
+    test "C2: empty select is rejected" do
+      assert Channel.normalize_filter("postgres_changes", %{event: "*", schema: "public", select: []}) ==
+               {:error, :invalid_select}
+    end
+
+    test "C2: non-list select is rejected" do
+      assert Channel.normalize_filter("postgres_changes", %{event: "*", schema: "public", select: "id"}) ==
+               {:error, :invalid_select}
+    end
+
+    test "C2: select with non-binary elements is rejected" do
+      assert Channel.normalize_filter("postgres_changes", %{event: "*", schema: "public", select: ["id", 42]}) ==
+               {:error, :invalid_select}
+    end
+
+    test "C2: absent select passes through" do
+      assert Channel.normalize_filter("postgres_changes", %{event: "*", schema: "public"}) ==
+               {:ok, %{event: "*", schema: "public"}}
+    end
+
+    test "C2: other types skip select validation" do
+      assert Channel.normalize_filter("broadcast", %{event: "new_message", select: []}) ==
+               {:ok, %{event: "new_message", select: []}}
     end
   end
 end

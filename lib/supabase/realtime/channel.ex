@@ -46,6 +46,7 @@ defmodule Supabase.Realtime.Channel do
   """
 
   alias Supabase.Realtime
+  alias Supabase.Realtime.Filter
 
   @typedoc """
   Channel structure for Supabase Realtime subscriptions.
@@ -150,6 +151,36 @@ defmodule Supabase.Realtime.Channel do
       ref: opts[:ref] || generate_ref()
     }
   end
+
+  @doc """
+  Parses and validates a binding filter for `type`.
+
+  For `"postgres_changes"`: serializes a `%Supabase.Realtime.Filter{}`
+  given as the `:filter` value into its wire string, validates the optional
+  `:select` column list (a non-empty list of binaries; an empty list or any
+  non-binary element is rejected), and keeps the rest of the filter as-is.
+
+  For other types: keyword-to-map conversion and `event: :all`
+  normalization (existing behavior).
+  """
+  @spec normalize_filter(String.t(), map() | keyword()) :: {:ok, map()} | {:error, :invalid_select}
+  def normalize_filter(type, filter) when is_binary(type) do
+    filter = if is_list(filter), do: Map.new(filter), else: filter
+    filter = normalize_event_filter(filter)
+
+    if type == "postgres_changes" do
+      normalize_postgres_filter(filter)
+    else
+      {:ok, filter}
+    end
+  end
+
+  @doc """
+  Whether this channel was created with `private: true` (RLS-protected).
+  """
+  @spec private?(t()) :: boolean()
+  def private?(%__MODULE__{params: %{config: %{private: private}}}), do: !!private
+  def private?(_), do: false
 
   @doc """
   Updates the channel state.
@@ -444,6 +475,27 @@ defmodule Supabase.Realtime.Channel do
   def ack_enabled?(_), do: false
 
   # Private helper functions
+
+  defp normalize_postgres_filter(%{filter: %Filter{} = f} = filter) do
+    {:ok, %{filter | filter: Filter.build(f)}}
+  end
+
+  defp normalize_postgres_filter(filter) do
+    case Map.get(filter, :select) do
+      nil -> {:ok, filter}
+      select -> if valid_select?(select), do: {:ok, filter}, else: {:error, :invalid_select}
+    end
+  end
+
+  # A meaningful `select` is a non-empty list of column names. JS has no
+  # runtime validation (its type says string[]); an empty array is never
+  # meaningful on the wire, so it is rejected explicitly instead of being a
+  # silent no-op.
+  defp valid_select?(select) when is_list(select) and select != [] do
+    Enum.all?(select, &is_binary/1)
+  end
+
+  defp valid_select?(_), do: false
 
   defp binding_match?(binding, filter) do
     filter_keys = Map.keys(filter)

@@ -3,6 +3,7 @@ ExUnit.start()
 # Initialize Mimic
 Application.ensure_all_started(:mimic)
 Mimic.copy(:gun)
+Mimic.copy(Supabase.Fetcher)
 Mimic.copy(Supabase.Realtime.Channel.Registry)
 
 defmodule RealtimeTest do

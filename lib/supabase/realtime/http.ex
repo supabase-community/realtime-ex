@@ -18,8 +18,11 @@ defmodule Supabase.Realtime.HTTP do
 
   ## Example
 
-      # Usually called by the Connection module, but can be used directly:
-      Supabase.Realtime.HTTP.broadcast(client, token, "realtime:room:lobby", "new_msg", %{body: "hi"})
+      # Usually called by the Connection module, which passes the channel topic
+      # (the `realtime:` prefix is stripped here) and the private flag:
+      Supabase.Realtime.HTTP.broadcast(client, token, "realtime:room:lobby", "new_msg", %{body: "hi"},
+        private: true
+      )
   """
 
   alias Supabase.Fetcher
@@ -30,6 +33,9 @@ defmodule Supabase.Realtime.HTTP do
   @doc """
   Sends a broadcast message via HTTP POST using the Supabase Fetcher.
 
+  The `realtime:` topic prefix is stripped from `topic`, matching the JS
+  fallback's `topic: this.subTopic` wire shape.
+
   ## Parameters
 
   * `client` - The `Supabase.Client` struct
@@ -37,13 +43,21 @@ defmodule Supabase.Realtime.HTTP do
   * `topic` - The channel topic
   * `event` - The broadcast event name
   * `payload` - The message payload
+
+  ## Options
+
+  * `:private` - whether the channel is private (default `false`). Sent as
+    `private` on each message; the REST API authorizes private-channel
+    broadcasts with it.
   """
-  @spec broadcast(Supabase.Client.t(), String.t(), String.t(), String.t(), map()) ::
+  @spec broadcast(Supabase.Client.t(), String.t(), String.t(), String.t(), map(), keyword()) ::
           :ok | {:error, term()}
-  def broadcast(%Supabase.Client{} = client, token, topic, event, payload) do
+  def broadcast(%Supabase.Client{} = client, token, topic, event, payload, opts \\ []) do
+    private = Keyword.get(opts, :private, false)
+
     body = %{
       messages: [
-        %{topic: topic, event: event, payload: payload}
+        %{topic: strip_topic_prefix(topic), event: event, payload: payload, private: private}
       ]
     }
 
@@ -64,4 +78,10 @@ defmodule Supabase.Realtime.HTTP do
         {:error, reason}
     end
   end
+
+  # Every Elixir code path constructs topics with the exact `realtime:`
+  # prefix (Channel.new/3, Registry.normalize_topic), so an exact-prefix
+  # strip is complete (JS strips case-insensitively; unneeded here).
+  defp strip_topic_prefix("realtime:" <> sub_topic), do: sub_topic
+  defp strip_topic_prefix(topic), do: topic
 end

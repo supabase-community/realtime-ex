@@ -121,6 +121,15 @@ MyApp.Realtime.on(channel, "postgres_changes",
   event: :update, schema: "public", table: "users",
   filter: "id=eq.1"
 )
+
+# With the typed filter builder and a column select list
+alias Supabase.Realtime.Filter
+
+MyApp.Realtime.on(channel, "postgres_changes",
+  event: :update, schema: "public", table: "users",
+  filter: Filter.new() |> Filter.eq("id", 1) |> Filter.lt("age", 30),
+  select: ["id", "first_name"]
+)
 ```
 
 ### Broadcast Messages

@@ -235,12 +235,18 @@ defmodule Supabase.Realtime do
   @type postgres_changes_event_type :: :all | :insert | :update | :delete
   @typedoc """
   Filter for PostgreSQL database changes.
+
+  The `:filter` value is either the wire string (PostgREST syntax) or a
+  `Supabase.Realtime.Filter` struct, which `on/3` serializes automatically.
+  The optional `:select` list restricts the columns the server sends back in
+  the change payload's `record`.
   """
   @type postgres_changes_filter :: %{
           required(:event) => postgres_changes_event_type() | String.t(),
           required(:schema) => String.t(),
           optional(:table) => String.t(),
-          optional(:filter) => String.t()
+          optional(:filter) => String.t() | Supabase.Realtime.Filter.t(),
+          optional(:select) => [String.t()]
         }
   @type postgres_change_event ::
           {:postgres_changes, postgres_changes_event_type(), postgres_changes_filter()}
@@ -398,6 +404,17 @@ defmodule Supabase.Realtime do
       Realtime.on(channel, "broadcast", event: "new_message")
       Realtime.on(channel, "presence", event: "join")
 
+      # With a typed filter builder and a column `select` list
+      alias Supabase.Realtime.Filter
+
+      Realtime.on(channel, "postgres_changes",
+        event: :update,
+        schema: "public",
+        table: "users",
+        filter: Filter.new() |> Filter.eq("id", 1) |> Filter.lt("age", 30),
+        select: ["id", "first_name"]
+      )
+
   ## Returns
 
   * `:ok` - The binding was stored
@@ -407,6 +424,8 @@ defmodule Supabase.Realtime do
     join payload, so they cannot be added after the join started)
   * `{:error, :already_joined}` - Same, while the channel is joined. Broadcast
     bindings are allowed at any time.
+  * `{:error, :invalid_select}` - A `postgres_changes` `select:` was given
+    that is not a non-empty list of column names
   """
   @spec on(channel(), String.t(), event_filter()) :: :ok | {:error, term()}
   def on(%Channel{} = channel, type, filter) when is_binary(type) and (is_list(filter) or is_map(filter)) do

@@ -78,6 +78,7 @@ defmodule Supabase.Realtime.Connection do
           heartbeat_timer: reference() | nil,
           heartbeat_interval: pos_integer(),
           pending_heartbeat_ref: Realtime.ref() | nil,
+          heartbeat_sent_at: non_neg_integer() | nil,
           reconnect_attempts: non_neg_integer(),
           reconnect_after_ms: (non_neg_integer() -> pos_integer()),
           send_buffer: :queue.queue(),
@@ -242,6 +243,7 @@ defmodule Supabase.Realtime.Connection do
       heartbeat_timer: nil,
       heartbeat_interval: heartbeat_interval,
       pending_heartbeat_ref: nil,
+      heartbeat_sent_at: nil,
       reconnect_attempts: 0,
       reconnect_after_ms: reconnect_function,
       send_buffer: :queue.new(),
@@ -456,6 +458,12 @@ defmodule Supabase.Realtime.Connection do
     if state.pending_heartbeat_ref do
       # previous heartbeat unanswered: dead connection. Phoenix forces close +
       # reconnect here.
+      :telemetry.execute(
+        [:supabase, :realtime, :heartbeat],
+        %{},
+        %{status: :timeout, ref: state.pending_heartbeat_ref, client: state.client.base_url}
+      )
+
       Logger.warning("[#{__MODULE__}]: Heartbeat not acknowledged, forcing reconnect")
       {:noreply, connection_down(state)}
     else
@@ -465,10 +473,19 @@ defmodule Supabase.Realtime.Connection do
 
       send_message(message, state)
 
+      :telemetry.execute(
+        [:supabase, :realtime, :heartbeat],
+        %{},
+        %{status: :sent, ref: heartbeat_ref, client: state.client.base_url}
+      )
+
       {:noreply,
        %{
          state
          | pending_heartbeat_ref: heartbeat_ref,
+           # set/cleared together with pending_heartbeat_ref, so a matching
+           # reply always has a non-nil sent_at to measure latency from
+           heartbeat_sent_at: System.monotonic_time(:millisecond),
            heartbeat_timer: Process.send_after(self(), :heartbeat, state.heartbeat_interval)
        }}
     end
@@ -596,7 +613,8 @@ defmodule Supabase.Realtime.Connection do
       | socket: nil,
         stream_ref: nil,
         heartbeat_timer: nil,
-        pending_heartbeat_ref: nil
+        pending_heartbeat_ref: nil,
+        heartbeat_sent_at: nil
     }
 
     state = transition_status(state, :closed)
@@ -612,7 +630,8 @@ defmodule Supabase.Realtime.Connection do
     %{
       state
       | heartbeat_timer: Process.send_after(self(), :heartbeat, state.heartbeat_interval),
-        pending_heartbeat_ref: nil
+        pending_heartbeat_ref: nil,
+        heartbeat_sent_at: nil
     }
   end
 
@@ -701,7 +720,7 @@ defmodule Supabase.Realtime.Connection do
     event = get_in(payload, [:payload, :event]) || payload[:event] || "broadcast"
     inner_payload = get_in(payload, [:payload, :payload]) || payload[:payload] || %{}
 
-    Realtime.HTTP.broadcast(state.client, token, channel.topic, event, inner_payload)
+    Realtime.HTTP.broadcast(state.client, token, channel.topic, event, inner_payload, private: Channel.private?(channel))
   end
 
   # Private helper functions
@@ -808,10 +827,20 @@ defmodule Supabase.Realtime.Connection do
 
   defp handle_ws_message(
          %{"topic" => "phoenix", "event" => "phx_reply", "ref" => ref},
-         %{pending_heartbeat_ref: ref} = state
+         %{pending_heartbeat_ref: ref, heartbeat_sent_at: sent_at} = state
        ) do
+    latency = System.monotonic_time(:millisecond) - sent_at
+
+    :telemetry.execute(
+      [:supabase, :realtime, :heartbeat],
+      # latency is measured only on :ok; handlers must match on metadata
+      # status or read it with Map.get/3
+      %{latency: latency},
+      %{status: :ok, ref: ref, client: state.client.base_url}
+    )
+
     Logger.debug("[#{__MODULE__}]: Received heartbeat reply")
-    {:noreply, %{state | pending_heartbeat_ref: nil}}
+    {:noreply, %{state | pending_heartbeat_ref: nil, heartbeat_sent_at: nil}}
   end
 
   defp handle_ws_message(%{"event" => "phx_reply", "payload" => %{"status" => "ok"}, "ref" => ack_ref}, state)
