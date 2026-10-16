@@ -110,7 +110,8 @@ defmodule Supabase.Realtime.Message do
   end
 
   # Flat server shape per binding, dropping nil keys. Never sends the binding
-  # struct keys (type/filter/callback/id).
+  # struct keys (type/filter/callback/id). `select` is present only when the
+  # binding filter carries it (validated by Channel.normalize_filter/2).
   defp postgres_binding_filter(binding) do
     filter = binding.filter
 
@@ -118,7 +119,8 @@ defmodule Supabase.Realtime.Message do
       event: normalize_postgres_event(binding_filter_value(filter, :event)),
       schema: binding_filter_value(filter, :schema),
       table: binding_filter_value(filter, :table),
-      filter: binding_filter_value(filter, :filter)
+      filter: binding_filter_value(filter, :filter),
+      select: binding_filter_value(filter, :select)
     }
     |> Enum.reject(fn {_key, value} -> is_nil(value) end)
     |> Map.new()

@@ -38,6 +38,7 @@ defmodule Supabase.Realtime.MixProject do
     [
       supabase_dep(),
       {:gun, "~> 2.1"},
+      {:telemetry, "~> 1.2"},
       {:mimic, "~> 1.1", only: :test},
       {:styler, "~> 1.4", only: [:dev, :test], runtime: false},
       {:ex_doc, ">= 0.0.0", only: [:dev, :test], runtime: false},
@@ -76,8 +77,10 @@ defmodule Supabase.Realtime.MixProject do
           Supabase.Realtime.Serializer.V2
         ],
         Utilities: [
+          Supabase.Realtime.Filter,
           Supabase.Realtime.HTTP,
           Supabase.Realtime.Message,
+          Supabase.Realtime.Presence,
           Supabase.Realtime.Error,
           Supabase.Realtime.PostgresTypes
         ]
