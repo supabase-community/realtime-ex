@@ -9,10 +9,9 @@ defmodule Supabase.Realtime.WildcardEventTest do
   setup do
     unique_id = System.unique_integer([:positive])
     store_name = :"Store#{unique_id}"
-    table_name = :"table#{unique_id}"
     registry_name = :"Registry#{unique_id}"
 
-    start_supervised!({Store, name: store_name, table_name: table_name})
+    start_supervised!({Store, name: store_name})
     start_supervised!({Registry, module: RealtimeTest, name: registry_name, store: store_name})
 
     {:ok, %{registry: registry_name, store: store_name}}

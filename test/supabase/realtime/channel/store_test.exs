@@ -5,12 +5,12 @@ defmodule Supabase.Realtime.Channel.StoreTest do
   alias Supabase.Realtime.Channel.Store
 
   setup do
-    # Start a store with unique name and table name for test isolation
+    # Start a store with a unique name for test isolation (the ETS table is
+    # unnamed now, so two stores can coexist in the same VM)
     unique_id = System.unique_integer([:positive])
     store_name = :"Store#{unique_id}"
-    table_name = :"supabase_realtime_channels_#{unique_id}"
 
-    start_supervised!({Store, name: store_name, table_name: table_name})
+    start_supervised!({Store, name: store_name})
 
     channel1 = Channel.new("test:channel1", self())
     channel2 = Channel.new("test:channel2", self())
@@ -81,6 +81,46 @@ defmodule Supabase.Realtime.Channel.StoreTest do
 
       assert {:ok, fetched} = Store.find_by_ref(store, channel.ref)
       assert fetched.join_ref == "join456"
+    end
+  end
+
+  describe "leave_ref" do
+    test "update_leave_ref/3 stores the leave reference", %{store: store, channel1: channel} do
+      Store.insert(store, channel)
+
+      assert {:ok, updated} = Store.update_leave_ref(store, channel, "leave123")
+      assert updated.leave_ref == "leave123"
+
+      assert {:ok, fetched} = Store.find_by_ref(store, channel.ref)
+      assert fetched.leave_ref == "leave123"
+    end
+
+    test "find_by_leave_ref/2 finds the channel", %{store: store, channel1: channel} do
+      Store.insert(store, channel)
+      {:ok, _} = Store.update_leave_ref(store, channel, "leave123")
+
+      assert {:ok, found} = Store.find_by_leave_ref(store, "leave123")
+      assert found.ref == channel.ref
+
+      assert {:error, :not_found} = Store.find_by_leave_ref(store, "nonexistent")
+    end
+  end
+
+  describe "per-client ETS tables" do
+    test "two stores can start with default options and stay independent" do
+      unique_id = System.unique_integer([:positive])
+
+      store_a = start_supervised!(Supervisor.child_spec({Store, name: :"StoreA#{unique_id}"}, id: :store_a))
+      store_b = start_supervised!(Supervisor.child_spec({Store, name: :"StoreB#{unique_id}"}, id: :store_b))
+
+      channel_a = Channel.new("test:a", self())
+      channel_b = Channel.new("test:b", self())
+
+      assert {:ok, ^channel_a} = Store.insert(store_a, channel_a)
+      assert {:ok, ^channel_b} = Store.insert(store_b, channel_b)
+
+      assert Store.all(store_a) == [channel_a]
+      assert Store.all(store_b) == [channel_b]
     end
   end
 

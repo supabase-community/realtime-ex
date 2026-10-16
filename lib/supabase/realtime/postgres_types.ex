@@ -99,7 +99,7 @@ defmodule Supabase.Realtime.PostgresTypes do
   end
 
   defp cast(value, type) when type in ~w(json jsonb) do
-    case Jason.decode(to_string(value)) do
+    case JSON.decode(to_string(value)) do
       {:ok, decoded} -> decoded
       _ -> value
     end

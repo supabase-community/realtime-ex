@@ -11,7 +11,7 @@ defmodule Supabase.Realtime do
   The client has three main components:
 
   1. **Connection** - WebSocket management, heartbeats, reconnection with
-     exponential backoff, send/push buffers, and HTTP fallback for broadcasts.
+     stepped backoff, send/push buffers, and HTTP fallback for broadcasts.
   2. **Channel Registry** - Routes messages to handlers, tracks channel states,
      supports wildcard event matching.
   3. **Channel Store** - ETS-based storage for channel data.
@@ -127,14 +127,16 @@ defmodule Supabase.Realtime do
   * `:client` (required) - A `%Supabase.Client{}` struct from `Supabase.init_client/3`.
   * `:name` - Process registration name.
   * `:timeout` - Connection timeout in milliseconds (default: 10000).
-  * `:heartbeat_interval` - Milliseconds between heartbeats (default: 30000).
+  * `:heartbeat_interval` - Milliseconds between heartbeats (default: 25000).
   * `:reconnect_after_ms` - A function that receives the attempt count and returns
-    a delay in milliseconds. Defaults to exponential backoff.
+    a delay in milliseconds. Defaults to stepped backoff (1s, 2s, 5s, 10s).
   * `:http_fallback` - When `true`, broadcast messages are sent over HTTP
     if the WebSocket connection is down (default: false).
   * `:access_token_fn` - A zero-arity function or `{mod, fun, args}` tuple
     that returns `{:ok, token}` or `{:error, reason}`. Used to refresh tokens
     before each connection attempt.
+  * `:tls_opts` - Keyword list merged over the default TLS options, for hosts
+    without an OS trust store or with a private CA.
   * `:params` - A map of extra query params appended to the WebSocket URL.
 
   ### Example with all options
@@ -334,10 +336,11 @@ defmodule Supabase.Realtime do
   * `:client` (required) - A `%Supabase.Client{}` struct from `Supabase.init_client/3`.
   * `:name` - Registers the process with the given name.
   * `:timeout` - Connection timeout in milliseconds (default: 10000).
-  * `:heartbeat_interval` - Milliseconds between heartbeats (default: 30000).
+  * `:heartbeat_interval` - Milliseconds between heartbeats (default: 25000).
   * `:reconnect_after_ms` - Function that receives attempt count and returns delay in ms.
   * `:http_fallback` - Send broadcasts over HTTP when WebSocket is down (default: false).
   * `:access_token_fn` - Zero-arity function returning `{:ok, token}` for token refresh.
+  * `:tls_opts` - Keyword list merged over the default TLS options.
   * `:params` - Map of extra query params for the WebSocket URL.
   """
   @spec start_link(module(), [start_option()]) :: Supervisor.on_start()
@@ -379,6 +382,16 @@ defmodule Supabase.Realtime do
       Realtime.on(channel, "postgres_changes", event: :insert, schema: "public", table: "users")
       Realtime.on(channel, "broadcast", event: "new_message")
       Realtime.on(channel, "presence", event: "join")
+
+  ## Returns
+
+  * `:ok` - The binding was stored
+  * `{:error, :channel_not_found}` - The channel is not registered
+  * `{:error, :already_joining}` - A `postgres_changes` or `presence` binding
+    was added while the channel is joining (these bindings are part of the
+    join payload, so they cannot be added after the join started)
+  * `{:error, :already_joined}` - Same, while the channel is joined. Broadcast
+    bindings are allowed at any time.
   """
   @spec on(channel(), String.t(), event_filter()) :: :ok | {:error, term()}
   def on(%Channel{} = channel, type, filter) when is_binary(type) and (is_list(filter) or is_map(filter)) do
@@ -482,7 +495,10 @@ defmodule Supabase.Realtime do
   Updates the access token for all connections.
 
   This function allows refreshing the authentication token used with the Realtime
-  connection without disconnecting. It updates the token for all channels.
+  connection without disconnecting. The token is persisted on the connection
+  state and applied on the next join/rejoin payload, so it returns `:ok` even
+  when disconnected. Joined channels get an immediate `access_token` push
+  while the WebSocket is open.
 
   ## Parameters
 
@@ -491,8 +507,8 @@ defmodule Supabase.Realtime do
 
   ## Returns
 
-  * `:ok` - Successfully sent the token update
-  * `{:error, term()}` - Failed to send the token update
+  * `:ok` - The token was persisted
+  * `{:error, term()}` - Failed to resolve the connection
   """
   @spec set_auth(pid() | module(), String.t()) :: :ok | {:error, term()}
   def set_auth(conn, token) when is_binary(token) do
@@ -712,13 +728,14 @@ defmodule Supabase.Realtime do
       def init(opts) do
         module = opts[:name] || __MODULE__
         client = Keyword.fetch!(opts, :client)
-        heartbeat_interval = opts[:heartbeat_interval] || to_timeout(second: 30)
+        heartbeat_interval = opts[:heartbeat_interval] || to_timeout(second: 25)
         store_name = Module.concat(module, Store)
         registry_name = Module.concat(module, Registry)
         conn_name = Module.concat(module, Connection)
         reconnect_after_ms = opts[:reconnect_after_ms]
         http_fallback = opts[:http_fallback] || false
         access_token_fn = opts[:access_token_fn]
+        tls_opts = opts[:tls_opts]
         custom_params = opts[:params] || %{}
 
         children =
@@ -734,6 +751,7 @@ defmodule Supabase.Realtime do
              reconnect_after_ms: reconnect_after_ms,
              http_fallback: http_fallback,
              access_token_fn: access_token_fn,
+             tls_opts: tls_opts,
              params: custom_params}
           ]
 

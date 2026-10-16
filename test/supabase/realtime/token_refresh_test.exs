@@ -22,9 +22,8 @@ defmodule Supabase.Realtime.TokenRefreshTest do
     registry_name = :"Registry#{unique_id}"
     store_name = :"Store#{unique_id}"
     conn_name = :"Connection#{unique_id}"
-    table_name = :"table#{unique_id}"
 
-    start_supervised!({Store, name: store_name, table_name: table_name})
+    start_supervised!({Store, name: store_name})
     start_supervised!({Registry, module: RealtimeTest, name: registry_name, store: store_name})
 
     {:ok,
