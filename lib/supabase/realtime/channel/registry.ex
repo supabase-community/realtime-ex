@@ -254,40 +254,7 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   def handle_cast({:handle_message, %{"event" => event} = msg}, state) do
-    topic = Map.get(msg, "topic")
-    payload = Map.get(msg, "payload", %{})
-    channels = Store.find_all_by_topic(state.store, topic)
-
-    case event do
-      "phx_close" ->
-        handle_phx_close(topic, state)
-
-      "phx_error" ->
-        handle_phx_error(topic, state)
-
-      "phx_reply" ->
-        handle_reply(msg, state)
-
-      "postgres_changes" ->
-        handle_postgres_changes(channels, payload, state)
-
-      "broadcast" ->
-        handle_broadcast(channels, payload, state)
-
-      "presence_state" ->
-        handle_presence_state(channels, payload, state)
-
-      "presence_diff" ->
-        handle_presence_diff(channels, payload, state)
-
-      "system" ->
-        Logger.debug("[#{__MODULE__}]: Ignoring system message: #{inspect(payload)}")
-        {:noreply, state}
-
-      other ->
-        Logger.debug("[#{__MODULE__}]: Ignoring unknown event: #{inspect(other)}")
-        {:noreply, state}
-    end
+    dispatch_message(event, msg, state)
   end
 
   @impl true
@@ -563,6 +530,40 @@ defmodule Supabase.Realtime.Channel.Registry do
   defp maybe_update_binding_ids(_channel, _payload, _state), do: :ok
 
   # Helper to dispatch events to the callback module if available
+  # Wire-event dispatch. One function head per event keeps each clause's
+  # cyclomatic complexity flat as the event table grows.
+  defp dispatch_message("phx_close", msg, state), do: handle_phx_close(msg_topic(msg), state)
+
+  defp dispatch_message("phx_error", msg, state), do: handle_phx_error(msg_topic(msg), state)
+
+  defp dispatch_message("phx_reply", msg, state), do: handle_reply(msg, state)
+
+  defp dispatch_message("postgres_changes", msg, state),
+    do: handle_postgres_changes(topic_channels(msg, state), msg_payload(msg), state)
+
+  defp dispatch_message("broadcast", msg, state),
+    do: handle_broadcast(topic_channels(msg, state), msg_payload(msg), state)
+
+  defp dispatch_message("presence_state", msg, state),
+    do: handle_presence_state(topic_channels(msg, state), msg_payload(msg), state)
+
+  defp dispatch_message("presence_diff", msg, state),
+    do: handle_presence_diff(topic_channels(msg, state), msg_payload(msg), state)
+
+  defp dispatch_message("system", msg, state) do
+    Logger.debug("[#{__MODULE__}]: Ignoring system message: #{inspect(msg_payload(msg))}")
+    {:noreply, state}
+  end
+
+  defp dispatch_message(event, _msg, state) do
+    Logger.debug("[#{__MODULE__}]: Ignoring unknown event: #{inspect(event)}")
+    {:noreply, state}
+  end
+
+  defp msg_topic(msg), do: Map.get(msg, "topic")
+  defp msg_payload(msg), do: Map.get(msg, "payload", %{})
+  defp topic_channels(msg, state), do: Store.find_all_by_topic(state.store, msg_topic(msg))
+
   defp dispatch_event(state, channels, event) do
     if channels != [] and function_exported?(state.module, :handle_event, 1) do
       Task.start(fn ->
