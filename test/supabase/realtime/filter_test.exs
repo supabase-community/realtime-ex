@@ -3,6 +3,11 @@ defmodule Supabase.Realtime.FilterTest do
 
   alias Supabase.Realtime.Filter
 
+  # Deliberate bad calls go through apply/3 so the gradual type checker
+  # (Elixir 1.20+) does not reject them at compile time: these test RUNTIME
+  # guards, not the static contract.
+  defp invoke(name, args), do: apply(Filter, name, args)
+
   describe "serialization" do
     test "F1: joins conditions with commas in insertion order" do
       filter = Filter.new() |> Filter.eq("id", 1) |> Filter.lt("age", 30)
@@ -128,7 +133,7 @@ defmodule Supabase.Realtime.FilterTest do
 
     test "F22: non-list values raise a guard error" do
       assert_raise FunctionClauseError, fn ->
-        apply(Filter, :within, ["status", "active"])
+        invoke(:within, ["status", "active"])
       end
     end
   end
@@ -186,12 +191,12 @@ defmodule Supabase.Realtime.FilterTest do
     # the deliberate bad calls go through apply/3 so the gradual type checker
     # does not flag them: these test RUNTIME guards, not the static contract
     test "non-binary columns raise FunctionClauseError" do
-      assert_raise FunctionClauseError, fn -> apply(Filter, :eq, [42, 1]) end
-      assert_raise FunctionClauseError, fn -> apply(Filter, :is_distinct, [nil, nil]) end
+      assert_raise FunctionClauseError, fn -> invoke(:eq, [42, 1]) end
+      assert_raise FunctionClauseError, fn -> invoke(:is_distinct, [nil, nil]) end
     end
 
     test "atom values are rejected" do
-      assert_raise FunctionClauseError, fn -> apply(Filter, :eq, ["col", :atom]) end
+      assert_raise FunctionClauseError, fn -> invoke(:eq, ["col", :atom]) end
     end
 
     test "invalid is value via negate still raises ArgumentError" do
@@ -202,7 +207,7 @@ defmodule Supabase.Realtime.FilterTest do
 
     test "negate rejects non-scalar values for scalar operators" do
       assert_raise FunctionClauseError, fn ->
-        apply(Filter, :negate, ["col", :eq, %{}])
+        invoke(:negate, ["col", :eq, %{}])
       end
     end
   end

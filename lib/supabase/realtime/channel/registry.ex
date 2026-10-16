@@ -212,22 +212,7 @@ defmodule Supabase.Realtime.Channel.Registry do
         {:reply, {:error, error}, state}
 
       {:ok, found} ->
-        # normalize before store: an invalid filter is replied as an error
-        # without being stored
-        case Channel.normalize_filter(type, filter) do
-          {:ok, filter} ->
-            {:ok, updated} = Store.add_binding(state.store, found, type, filter)
-
-            if updated.state in [:closed, :errored] do
-              {:reply, :ok, state, {:continue, {:join, updated}}}
-            else
-              # broadcast bindings on a joining/joined channel
-              {:reply, :ok, state}
-            end
-
-          {:error, :invalid_select} ->
-            {:reply, {:error, :invalid_select}, state}
-        end
+        subscribe_binding(found, type, filter, state)
 
       {:error, :not_found} ->
         {:reply, {:error, :channel_not_found}, state}
@@ -253,6 +238,25 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   def handle_call(:get_presence_state, _from, state) do
     {:reply, state.presence_state, state}
+  end
+
+  # normalize before store: an invalid filter is replied as an error without
+  # being stored
+  defp subscribe_binding(found, type, filter, state) do
+    case Channel.normalize_filter(type, filter) do
+      {:ok, filter} ->
+        {:ok, updated} = Store.add_binding(state.store, found, type, filter)
+
+        if updated.state in [:closed, :errored] do
+          {:reply, :ok, state, {:continue, {:join, updated}}}
+        else
+          # broadcast bindings on a joining/joined channel
+          {:reply, :ok, state}
+        end
+
+      {:error, :invalid_select} ->
+        {:reply, {:error, :invalid_select}, state}
+    end
   end
 
   @impl true

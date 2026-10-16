@@ -50,20 +50,24 @@ defmodule Supabase.Realtime.Presence do
 
   defp apply_leaves(state, leaves) do
     Enum.reduce(leaves, state, fn {key, left_entry}, acc ->
-      case Map.get(acc, key) do
-        nil ->
-          acc
-
-        %{"metas" => current_metas} = current_entry ->
-          left_refs = Enum.map(left_entry["metas"], & &1["phx_ref"])
-          remaining = Enum.reject(current_metas, &(&1["phx_ref"] in left_refs))
-
-          if remaining == [] do
-            Map.delete(acc, key)
-          else
-            Map.put(acc, key, Map.put(current_entry, "metas", remaining))
-          end
-      end
+      apply_leave(acc, key, left_entry)
     end)
+  end
+
+  defp apply_leave(acc, key, left_entry) do
+    case Map.get(acc, key) do
+      nil ->
+        acc
+
+      %{"metas" => current_metas} = current_entry ->
+        left_refs = Enum.map(left_entry["metas"], & &1["phx_ref"])
+        remaining = Enum.reject(current_metas, &(&1["phx_ref"] in left_refs))
+
+        if remaining == [] do
+          Map.delete(acc, key)
+        else
+          Map.put(acc, key, Map.put(current_entry, "metas", remaining))
+        end
+    end
   end
 end
