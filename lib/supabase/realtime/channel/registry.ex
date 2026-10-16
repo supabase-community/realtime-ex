@@ -430,30 +430,41 @@ defmodule Supabase.Realtime.Channel.Registry do
   defp fire_rejoin(channel_ref, entry, state) do
     case Store.find_by_ref(state.store, channel_ref) do
       {:ok, %Channel{state: :errored} = channel} ->
-        if connection_alive?(state.connection) do
-          {:ok, ch} = Store.update_state(state.store, channel, :joining)
-
-          case Connection.join_channel(state.connection, ch) do
-            :ok ->
-              %{state | rejoin_timers: Map.put(state.rejoin_timers, channel_ref, entry)}
-
-            # socket-level recovery owns it: revert and drop
-            {:error, :not_connected} ->
-              Store.update_state(state.store, ch, :errored)
-              %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
-
-            {:error, :channel_not_found} ->
-              %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
-          end
-        else
-          %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
-        end
+        rejoin_errored(channel_ref, entry, channel, state)
 
       # channel gone, not :errored, or connection dead: the :open sweep or
       # user action owns it
       _ ->
-        %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
+        drop_rejoin(state, channel_ref)
     end
+  end
+
+  defp rejoin_errored(channel_ref, entry, channel, state) do
+    if connection_alive?(state.connection) do
+      {:ok, ch} = Store.update_state(state.store, channel, :joining)
+      send_rejoin(channel_ref, entry, ch, state)
+    else
+      drop_rejoin(state, channel_ref)
+    end
+  end
+
+  defp send_rejoin(channel_ref, entry, channel, state) do
+    case Connection.join_channel(state.connection, channel) do
+      :ok ->
+        %{state | rejoin_timers: Map.put(state.rejoin_timers, channel_ref, entry)}
+
+      # socket-level recovery owns it: revert and drop
+      {:error, :not_connected} ->
+        Store.update_state(state.store, channel, :errored)
+        drop_rejoin(state, channel_ref)
+
+      {:error, :channel_not_found} ->
+        drop_rejoin(state, channel_ref)
+    end
+  end
+
+  defp drop_rejoin(state, channel_ref) do
+    %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
   end
 
   # Rejoin sweep on :open: every channel that was joining, joined or errored
