@@ -138,6 +138,16 @@ defmodule Supabase.Realtime do
   * `:tls_opts` - Keyword list merged over the default TLS options, for hosts
     without an OS trust store or with a private CA.
   * `:params` - A map of extra query params appended to the WebSocket URL.
+  * `:vsn` - Realtime protocol version negotiated in the WebSocket query
+    string. "1.0.0" (default) sends JSON objects in text frames; "2.0.0" opts
+    into JSON arrays plus binary framing for user broadcasts. The negotiated
+    vsn always wins over any `vsn` key inside `:params`.
+  * `:serializer` - A module implementing the
+    `Supabase.Realtime.Serializer` behaviour. Overrides the serializer derived
+    from `:vsn`; you own matching it to the wire format the server negotiates
+    for the given vsn. Satisfies realtime-js style custom encode/decode hooks.
+  * `:serializer_opts` - Keyword list forwarded to every serializer
+    encode/decode call. `Serializer.V2` reads `:allowed_metadata_keys`.
 
   ### Example with all options
 
@@ -342,6 +352,11 @@ defmodule Supabase.Realtime do
   * `:access_token_fn` - Zero-arity function returning `{:ok, token}` for token refresh.
   * `:tls_opts` - Keyword list merged over the default TLS options.
   * `:params` - Map of extra query params for the WebSocket URL.
+  * `:vsn` - Realtime protocol version ("1.0.0" default | "2.0.0"); overrides
+    any `vsn` key inside `:params` in the query string.
+  * `:serializer` - Module implementing the `Supabase.Realtime.Serializer`
+    behaviour; overrides the vsn-derived serializer.
+  * `:serializer_opts` - Keyword list forwarded to every serializer call.
   """
   @spec start_link(module(), [start_option()]) :: Supervisor.on_start()
   def start_link(module, opts \\ []) do
@@ -752,6 +767,9 @@ defmodule Supabase.Realtime do
              http_fallback: http_fallback,
              access_token_fn: access_token_fn,
              tls_opts: tls_opts,
+             vsn: opts[:vsn],
+             serializer: opts[:serializer],
+             serializer_opts: opts[:serializer_opts],
              params: custom_params}
           ]
 
