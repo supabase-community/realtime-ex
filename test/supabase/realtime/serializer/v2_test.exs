@@ -3,9 +3,10 @@ defmodule Supabase.Realtime.Serializer.V2Test do
 
   alias Supabase.Realtime.Serializer.V2
 
-  # The worked example from the spec (section 4). The user payload map has two
-  # keys whose JSON order is stable (x before y), so the byte vectors below are
-  # exact.
+  # The worked example from the spec (section 4). JSON object key order is not
+  # part of the protocol and varies with the OTP map implementation, so the
+  # payload bytes come from the same encoder the serializer uses rather than a
+  # hardcoded literal.
   @worked_message %{
     topic: "realtime:sala",
     event: "broadcast",
@@ -15,7 +16,7 @@ defmodule Supabase.Realtime.Serializer.V2Test do
   }
 
   @worked_frame <<3, 1, 2, 13, 9, 0, 1>> <>
-                  "7" <> "42" <> "realtime:sala" <> "posição" <> "" <> ~s({"x":1,"y":2})
+                  "7" <> "42" <> "realtime:sala" <> "posição" <> "" <> JSON.encode!(%{x: 1, y: 2})
 
   describe "encode/2 - kind 3 (userBroadcastPush)" do
     test "encodes the worked example as an exact 45-byte binary frame" do

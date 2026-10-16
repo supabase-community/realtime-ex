@@ -701,7 +701,7 @@ defmodule Supabase.Realtime.ConnectionTest do
           "realtime:sala" <>
           "posição" <>
           "" <>
-          ~s({"x":1,"y":2})
+          JSON.encode!(%{x: 1, y: 2})
 
       assert_received {:ws_frame, {:binary, ^expected}}
     end
