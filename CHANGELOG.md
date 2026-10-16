@@ -2,6 +2,20 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.6.0](https://github.com/supabase-community/realtime-ex/compare/v0.5.0...v0.6.0) (2026-10-16)
+
+
+### Features
+
+* filter builder, select, heartbeat telemetry and presence fixes ([#44](https://github.com/supabase-community/realtime-ex/issues/44)) ([6fa0dae](https://github.com/supabase-community/realtime-ex/commit/6fa0dae897097e1b5ef324568eff17c2df652aed))
+* rejoin backoff, duplicate binding dedup and aligned binding ids ([#46](https://github.com/supabase-community/realtime-ex/issues/46)) ([ce458d9](https://github.com/supabase-community/realtime-ex/commit/ce458d9884868bad815216ae82499810e8bf5648))
+* serializer behaviour and vsn 2.0.0 binary framing ([#43](https://github.com/supabase-community/realtime-ex/issues/43)) ([3aec1d6](https://github.com/supabase-community/realtime-ex/commit/3aec1d636658322e7c02cd81a4c2dae942a7cfb7))
+
+
+### Bug Fixes
+
+* realtime protocol correctness (join, ack, heartbeat, tls) ([#42](https://github.com/supabase-community/realtime-ex/issues/42)) ([73548ac](https://github.com/supabase-community/realtime-ex/commit/73548ac3a4a1a536c4b33cb22202462d2a678b4f))
+
 ## [0.5.0](https://github.com/supabase-community/realtime-ex/compare/v0.4.0...v0.5.0) (2026-04-07)
 
 
