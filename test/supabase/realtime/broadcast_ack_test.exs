@@ -18,14 +18,14 @@ defmodule Supabase.Realtime.BroadcastAckTest do
     assert Channel.ack_enabled?(ack_channel)
   end
 
-  test "broadcast message with ack includes ack_ref" do
+  test "broadcast message with ack carries ack_ref as the wire ref" do
     registry_pid = self()
     channel = Channel.new("test:channel", registry_pid)
     ack_ref = "ack:test123"
 
     message = Message.broadcast_message_with_ack(channel, "event", %{data: "test"}, ack_ref)
 
-    assert message.ack_ref == ack_ref
+    assert message.ref == ack_ref
     assert message.payload.event == "event"
   end
 

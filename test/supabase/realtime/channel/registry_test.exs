@@ -10,9 +10,8 @@ defmodule Supabase.Realtime.Channel.RegistryTest do
   setup do
     unique_id = System.unique_integer([:positive])
     store_name = :"StoreForRegistry#{unique_id}"
-    table_name = :"registry_test_table#{unique_id}"
 
-    _store_pid = start_supervised!({Store, name: store_name, table_name: table_name})
+    _store_pid = start_supervised!({Store, name: store_name})
 
     registry_pid =
       start_supervised!({Registry, module: RealtimeTest, name: :"TestRegistry#{unique_id}", store: store_name})
@@ -118,7 +117,7 @@ defmodule Supabase.Realtime.Channel.RegistryTest do
   end
 
   describe "unsubscribe/2" do
-    test "marks channel as leaving", %{registry: registry, store: store} do
+    test "completes the leave locally when there is no connection", %{registry: registry, store: store} do
       {:ok, channel} = Registry.create_channel(registry, "my_topic")
 
       # Setting channel registry to self to avoid the "process attempted to call itself" error
@@ -128,8 +127,9 @@ defmodule Supabase.Realtime.Channel.RegistryTest do
       # Give time for the state to be updated
       Process.sleep(50)
 
-      {:ok, stored_channel} = Store.find_by_ref(store, channel.ref)
-      assert stored_channel.state == :leaving
+      # no connection: the server lost every channel on disconnect, so the
+      # leave is complete locally
+      assert {:error, :not_found} = Store.find_by_ref(store, channel.ref)
     end
 
     test "returns error for non-existent channel", %{registry: registry} do

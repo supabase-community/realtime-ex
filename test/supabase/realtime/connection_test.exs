@@ -160,6 +160,347 @@ defmodule Supabase.Realtime.ConnectionTest do
     assert log =~ "Failed to connect"
   end
 
+  describe "token resolution" do
+    defp capture_upgrade_headers(opts) do
+      test = self()
+
+      stub(:gun, :open, fn _, _, _ -> {:ok, test} end)
+
+      stub(:gun, :ws_upgrade, fn _socket, _path, headers ->
+        send(test, {:upgrade_headers, headers})
+        make_ref()
+      end)
+
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+
+      pid = start_supervised!({Connection, opts})
+      send(pid, {:gun_up, test, :http})
+      assert_receive {:upgrade_headers, headers}, 1000
+      headers
+    end
+
+    test "falls back to api_key when client.access_token is nil", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      client = %{@mock_client | access_token: nil}
+
+      headers =
+        capture_upgrade_headers(name: conn_name, registry: registry, store: store, client: client)
+
+      auth = List.keyfind(headers, ~c"authorization", 0)
+      assert auth == {~c"authorization", ~c"Bearer mock_api_key"}
+    end
+
+    test "access_token_fn wins over client token", %{registry: registry, store: store, conn_name: conn_name} do
+      headers =
+        capture_upgrade_headers(
+          name: conn_name,
+          registry: registry,
+          store: store,
+          client: @mock_client,
+          access_token_fn: fn -> {:ok, "fn_token"} end
+        )
+
+      assert List.keyfind(headers, ~c"authorization", 0) == {~c"authorization", ~c"Bearer fn_token"}
+    end
+
+    test "failing access_token_fn falls through to client token", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      headers =
+        capture_upgrade_headers(
+          name: conn_name,
+          registry: registry,
+          store: store,
+          client: @mock_client,
+          access_token_fn: fn -> {:error, :unavailable} end
+        )
+
+      assert List.keyfind(headers, ~c"authorization", 0) == {~c"authorization", ~c"Bearer mock_token"}
+    end
+  end
+
+  describe "gun options" do
+    defp capture_open_opts(opts) do
+      test = self()
+
+      stub(:gun, :open, fn _host, _port, gun_opts ->
+        send(test, {:gun_open_opts, gun_opts})
+        {:error, :econnrefused}
+      end)
+
+      start_supervised!({Connection, opts})
+      assert_receive {:gun_open_opts, gun_opts}, 1000
+      gun_opts
+    end
+
+    test "uses retry 0 and verify_peer TLS for wss URLs", %{registry: registry, store: store, conn_name: conn_name} do
+      client = %{@mock_client | realtime_url: "wss://example.com"}
+
+      opts =
+        capture_open_opts(name: conn_name, registry: registry, store: store, client: client)
+
+      assert opts.retry == 0
+      assert opts.transport == :tls
+      assert Keyword.get(opts.tls_opts, :verify) == :verify_peer
+      assert cacerts = Keyword.get(opts.tls_opts, :cacerts)
+      assert is_list(cacerts) and cacerts != []
+      assert Keyword.get(opts.tls_opts, :server_name_indication) == ~c"example.com"
+      assert Keyword.get(opts.tls_opts, :customize_hostname_check)
+      refute Keyword.get(opts.tls_opts, :verify) == :verify_none
+    end
+
+    test ":tls_opts start option merges over the verify_peer defaults", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      client = %{@mock_client | realtime_url: "wss://example.com"}
+
+      opts =
+        capture_open_opts(
+          name: conn_name,
+          registry: registry,
+          store: store,
+          client: client,
+          tls_opts: [depth: 5]
+        )
+
+      assert Keyword.get(opts.tls_opts, :depth) == 5
+      assert Keyword.get(opts.tls_opts, :verify) == :verify_peer
+      assert Keyword.get(opts.tls_opts, :cacerts) != []
+    end
+
+    test "plain ws URLs get no tls_opts", %{registry: registry, store: store, conn_name: conn_name} do
+      client = %{@mock_client | realtime_url: "http://example.com"}
+
+      opts =
+        capture_open_opts(name: conn_name, registry: registry, store: store, client: client)
+
+      assert opts.transport == :tcp
+      refute Map.has_key?(opts, :tls_opts)
+    end
+  end
+
+  describe "reconnect backoff" do
+    test "default backoff steps through the reconnect intervals", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      stub(:gun, :open, fn _, _, _ -> {:error, :econnrefused} end)
+
+      opts = [
+        name: conn_name,
+        registry: registry,
+        store: store,
+        client: @mock_client
+      ]
+
+      start_supervised!({Connection, opts})
+      Process.sleep(50)
+
+      for expected <- [1000, 2000, 5000, 10_000, 10_000] do
+        timer = :sys.get_state(conn_name).reconnect_timer
+        assert is_reference(timer)
+        remaining = Process.cancel_timer(timer)
+        assert remaining in (expected - 150)..expected
+        send(conn_name, :reconnect)
+        Process.sleep(10)
+      end
+    end
+
+    test "reconnect_attempts resets to 0 when the connection opens", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
+      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+
+      opts = [name: conn_name, registry: registry, store: store, client: @mock_client]
+      start_supervised!({Connection, opts})
+      Process.sleep(50)
+
+      socket = self()
+      stream_ref = make_ref()
+
+      :sys.replace_state(conn_name, fn state ->
+        %{state | reconnect_attempts: 3, socket: socket, stream_ref: stream_ref, status: :connecting}
+      end)
+
+      send(conn_name, {:gun_upgrade, socket, stream_ref, ["websocket"], []})
+      Process.sleep(50)
+
+      state = :sys.get_state(conn_name)
+      assert state.status == :open
+      assert state.reconnect_attempts == 0
+    end
+  end
+
+  describe "connection lifecycle" do
+    defp drive_to_open(conn) do
+      socket = self()
+      stream_ref = make_ref()
+
+      :sys.replace_state(conn, fn state ->
+        %{state | socket: socket, stream_ref: stream_ref, status: :connecting}
+      end)
+
+      send(conn, {:gun_upgrade, socket, stream_ref, ["websocket"], []})
+      Process.sleep(20)
+      {socket, stream_ref}
+    end
+
+    defp stub_close do
+      test = self()
+
+      stub(:gun, :close, fn socket ->
+        send(test, {:gun_closed, socket})
+        :ok
+      end)
+    end
+
+    test "keeps exactly one heartbeat timer across upgrades", %{registry: registry, store: store, conn_name: conn_name} do
+      test = self()
+      stub(:gun, :open, fn _, _, _ -> {:ok, test} end)
+      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+
+      start_supervised!({Connection, name: conn_name, registry: registry, store: store, client: @mock_client})
+      Process.sleep(50)
+
+      {socket, _stream_ref} = drive_to_open(conn_name)
+
+      first_timer = :sys.get_state(conn_name).heartbeat_timer
+      assert is_reference(first_timer)
+      refute Process.read_timer(first_timer) == false
+
+      # a repeated gun_up and a successful reconnect do not add a second timer
+      send(conn_name, {:gun_up, socket, :http})
+      Process.sleep(20)
+      assert :sys.get_state(conn_name).heartbeat_timer == first_timer
+
+      send(conn_name, :reconnect)
+      Process.sleep(20)
+      current_ref = :sys.get_state(conn_name).stream_ref
+      send(conn_name, {:gun_upgrade, socket, current_ref, ["websocket"], []})
+      Process.sleep(20)
+
+      state = :sys.get_state(conn_name)
+      assert state.heartbeat_timer != first_timer
+      assert Process.read_timer(first_timer) == false
+      refute Process.read_timer(state.heartbeat_timer) == false
+    end
+
+    test "dead heartbeat forces close and schedules reconnect", %{registry: registry, store: store, conn_name: conn_name} do
+      stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
+      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+      stub_close()
+
+      start_supervised!({Connection, name: conn_name, registry: registry, store: store, client: @mock_client})
+      Process.sleep(50)
+      {socket, _stream_ref} = drive_to_open(conn_name)
+
+      :sys.replace_state(conn_name, fn state -> %{state | pending_heartbeat_ref: "msg:dead"} end)
+      send(conn_name, :heartbeat)
+      Process.sleep(50)
+
+      assert_received {:gun_closed, ^socket}
+
+      state = :sys.get_state(conn_name)
+      assert state.status == :closed
+      assert state.socket == nil
+      assert state.stream_ref == nil
+      assert state.pending_heartbeat_ref == nil
+      assert is_reference(state.reconnect_timer)
+    end
+
+    test "gun_down cleans up, schedules reconnect and ignores stale messages", %{
+      registry: registry,
+      store: store,
+      conn_name: conn_name
+    } do
+      stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
+      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+      stub_close()
+
+      start_supervised!({Connection, name: conn_name, registry: registry, store: store, client: @mock_client})
+      Process.sleep(50)
+      {socket, _stream_ref} = drive_to_open(conn_name)
+
+      send(conn_name, {:gun_down, socket, :http, :normal, []})
+      Process.sleep(20)
+
+      assert_received {:gun_closed, ^socket}
+
+      state = :sys.get_state(conn_name)
+      assert state.status == :closed
+      assert state.socket == nil
+      assert state.stream_ref == nil
+      assert is_reference(state.reconnect_timer)
+
+      # a stale gun_down and :DOWN from an old gun pid are ignored
+      old_socket = spawn(fn -> Process.sleep(:infinity) end)
+      send(conn_name, {:gun_down, old_socket, :http, :normal, []})
+      send(conn_name, {:DOWN, make_ref(), :process, old_socket, :killed})
+      Process.sleep(20)
+
+      state = :sys.get_state(conn_name)
+      assert state.status == :closed
+      assert state.socket == nil
+    end
+
+    test "gun process :DOWN runs the same cleanup", %{registry: registry, store: store, conn_name: conn_name} do
+      stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
+      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+      stub_close()
+
+      start_supervised!({Connection, name: conn_name, registry: registry, store: store, client: @mock_client})
+      Process.sleep(50)
+      {socket, _stream_ref} = drive_to_open(conn_name)
+
+      send(conn_name, {:DOWN, make_ref(), :process, socket, :killed})
+      Process.sleep(20)
+
+      assert_received {:gun_closed, ^socket}
+
+      state = :sys.get_state(conn_name)
+      assert state.status == :closed
+      assert state.socket == nil
+      assert state.stream_ref == nil
+      assert is_reference(state.reconnect_timer)
+    end
+
+    test "failed upgrade does not stop the connection process", %{registry: registry, store: store, conn_name: conn_name} do
+      stub(:gun, :open, fn _, _, _ -> {:ok, self()} end)
+      stub(:gun, :ws_upgrade, fn _, _, _ -> make_ref() end)
+      stub(:gun, :ws_send, fn _, _, _ -> :ok end)
+      stub_close()
+
+      pid = start_supervised!({Connection, name: conn_name, registry: registry, store: store, client: @mock_client})
+      Process.sleep(50)
+      {socket, stream_ref} = drive_to_open(conn_name)
+
+      send(conn_name, {:gun_response, socket, stream_ref, :fin, 401, []})
+      Process.sleep(20)
+
+      assert Process.alive?(pid)
+
+      state = :sys.get_state(pid)
+      assert state.status == :closed
+      assert is_reference(state.reconnect_timer)
+    end
+  end
+
   test "connection process initializes properly", %{
     registry: registry,
     store: store,
@@ -186,7 +527,7 @@ defmodule Supabase.Realtime.ConnectionTest do
     assert state.store == store
     assert state.client == @mock_client
     # default
-    assert state.heartbeat_interval == 30_000
+    assert state.heartbeat_interval == 25_000
 
     # Connection should be attempting to connect
     assert state.status == :connecting

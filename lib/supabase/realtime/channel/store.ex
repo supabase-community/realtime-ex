@@ -11,8 +11,6 @@ defmodule Supabase.Realtime.Channel.Store do
 
   alias Supabase.Realtime.Channel
 
-  @table_name :supabase_realtime_channels
-
   # Client API
 
   @doc """
@@ -75,6 +73,31 @@ defmodule Supabase.Realtime.Channel.Store do
   """
   def update_join_ref(store \\ __MODULE__, %Channel{} = channel, join_ref) do
     GenServer.call(store, {:update_join_ref, channel, join_ref})
+  end
+
+  @doc """
+  Updates the leave reference of a channel.
+
+  ## Parameters
+
+  * `store` - The store process
+  * `channel` - The channel to update
+  * `leave_ref` - The new leave reference
+  """
+  def update_leave_ref(store \\ __MODULE__, %Channel{} = channel, leave_ref) do
+    GenServer.call(store, {:update_leave_ref, channel, leave_ref})
+  end
+
+  @doc """
+  Finds a channel by its leave reference.
+
+  ## Parameters
+
+  * `store` - The store process
+  * `leave_ref` - The leave reference
+  """
+  def find_by_leave_ref(store \\ __MODULE__, leave_ref) when is_binary(leave_ref) do
+    GenServer.call(store, {:find_by_leave_ref, leave_ref})
   end
 
   @doc """
@@ -186,9 +209,10 @@ defmodule Supabase.Realtime.Channel.Store do
   * `channel` - The channel to update
   * `ack_ref` - The acknowledgment reference
   * `caller` - The process that will receive the acknowledgment
+  * `timer` - Timer reference owned by the caller (the Connection)
   """
-  def add_pending_ack(store \\ __MODULE__, %Channel{} = channel, ack_ref, caller) do
-    GenServer.call(store, {:add_pending_ack, channel, ack_ref, caller})
+  def add_pending_ack(store \\ __MODULE__, %Channel{} = channel, ack_ref, caller, timer) do
+    GenServer.call(store, {:add_pending_ack, channel, ack_ref, caller, timer})
   end
 
   @doc """
@@ -218,32 +242,30 @@ defmodule Supabase.Realtime.Channel.Store do
   # Server callbacks
 
   @impl true
-  def init(opts) do
-    table_name = Keyword.get(opts, :table_name, @table_name)
-    table = :ets.new(table_name, [:set, :protected, :named_table])
+  def init(_opts) do
+    # Unnamed + protected: every access goes through this GenServer, so no
+    # other process needs the name. A second client in the same VM can no
+    # longer crash on :ets.new against a shared named table.
+    table = :ets.new(:supabase_realtime_channels, [:set, :protected])
     {:ok, %{table: table}}
   end
 
   @impl true
   def handle_call({:insert, %Channel{} = channel}, _from, state) do
-    # Primary key: channel ref
-    # Secondary indices: topic, join_ref
-    :ets.insert(state.table, {channel.ref, channel, channel.topic, channel.join_ref})
-
+    put(state.table, channel)
     {:reply, {:ok, channel}, state}
   end
 
   @impl true
   def handle_call({:update, %Channel{} = channel}, _from, state) do
-    :ets.insert(state.table, {channel.ref, channel, channel.topic, channel.join_ref})
-
+    put(state.table, channel)
     {:reply, {:ok, channel}, state}
   end
 
   @impl true
   def handle_call({:update_state, %Channel{} = channel, new_state}, _from, state) do
     updated_channel = Channel.update_state(channel, new_state)
-    :ets.insert(state.table, {channel.ref, updated_channel, channel.topic, channel.join_ref})
+    put(state.table, updated_channel)
 
     {:reply, {:ok, updated_channel}, state}
   end
@@ -251,7 +273,15 @@ defmodule Supabase.Realtime.Channel.Store do
   @impl true
   def handle_call({:update_join_ref, %Channel{} = channel, join_ref}, _from, state) do
     updated_channel = Channel.set_join_ref(channel, join_ref)
-    :ets.insert(state.table, {channel.ref, updated_channel, channel.topic, join_ref})
+    put(state.table, updated_channel)
+
+    {:reply, {:ok, updated_channel}, state}
+  end
+
+  @impl true
+  def handle_call({:update_leave_ref, %Channel{} = channel, leave_ref}, _from, state) do
+    updated_channel = Channel.set_leave_ref(channel, leave_ref)
+    put(state.table, updated_channel)
 
     {:reply, {:ok, updated_channel}, state}
   end
@@ -259,7 +289,7 @@ defmodule Supabase.Realtime.Channel.Store do
   @impl true
   def handle_call({:add_binding, %Channel{} = channel, type, filter, callback}, _from, state) do
     updated_channel = Channel.add_binding(channel, type, filter, callback)
-    :ets.insert(state.table, {channel.ref, updated_channel, channel.topic, channel.join_ref})
+    put(state.table, updated_channel)
 
     {:reply, {:ok, updated_channel}, state}
   end
@@ -267,7 +297,7 @@ defmodule Supabase.Realtime.Channel.Store do
   @impl true
   def handle_call({:remove_binding, %Channel{} = channel, type, filter}, _from, state) do
     updated_channel = Channel.remove_binding(channel, type, filter)
-    :ets.insert(state.table, {channel.ref, updated_channel, channel.topic, channel.join_ref})
+    put(state.table, updated_channel)
 
     {:reply, {:ok, updated_channel}, state}
   end
@@ -283,14 +313,14 @@ defmodule Supabase.Realtime.Channel.Store do
   def handle_call({:find_by_ref, ref}, _from, state) do
     {:reply,
      case :ets.lookup(state.table, ref) do
-       [{^ref, channel, _, _}] -> {:ok, channel}
+       [{^ref, channel, _, _, _}] -> {:ok, channel}
        [] -> {:error, :not_found}
      end, state}
   end
 
   @impl true
   def handle_call({:find_by_topic, topic}, _from, state) do
-    result = :ets.select(state.table, [{{:_, :"$1", topic, :_}, [], [:"$1"]}])
+    result = :ets.select(state.table, [{{:_, :"$1", topic, :_, :_}, [], [:"$1"]}])
 
     {:reply,
      case result do
@@ -301,7 +331,18 @@ defmodule Supabase.Realtime.Channel.Store do
 
   @impl true
   def handle_call({:find_by_join_ref, join_ref}, _from, state) do
-    result = :ets.select(state.table, [{{:_, :"$1", :_, join_ref}, [], [:"$1"]}])
+    result = :ets.select(state.table, [{{:_, :"$1", :_, join_ref, :_}, [], [:"$1"]}])
+
+    {:reply,
+     case result do
+       [channel | _] -> {:ok, channel}
+       [] -> {:error, :not_found}
+     end, state}
+  end
+
+  @impl true
+  def handle_call({:find_by_leave_ref, leave_ref}, _from, state) do
+    result = :ets.select(state.table, [{{:_, :"$1", :_, :_, leave_ref}, [], [:"$1"]}])
 
     {:reply,
      case result do
@@ -312,20 +353,20 @@ defmodule Supabase.Realtime.Channel.Store do
 
   @impl true
   def handle_call(:all, _from, state) do
-    channels = :ets.select(state.table, [{{:_, :"$1", :_, :_}, [], [:"$1"]}])
+    channels = :ets.select(state.table, [{{:_, :"$1", :_, :_, :_}, [], [:"$1"]}])
     {:reply, channels, state}
   end
 
   @impl true
   def handle_call({:find_all_by_topic, topic}, _from, state) do
-    channels = :ets.select(state.table, [{{:_, :"$1", topic, :_}, [], [:"$1"]}])
+    channels = :ets.select(state.table, [{{:_, :"$1", topic, :_, :_}, [], [:"$1"]}])
     {:reply, channels, state}
   end
 
   @impl true
-  def handle_call({:add_pending_ack, %Channel{} = channel, ack_ref, caller}, _from, state) do
-    updated_channel = Channel.add_pending_ack(channel, ack_ref, caller)
-    :ets.insert(state.table, {channel.ref, updated_channel, channel.topic, channel.join_ref})
+  def handle_call({:add_pending_ack, %Channel{} = channel, ack_ref, caller, timer}, _from, state) do
+    updated_channel = Channel.add_pending_ack(channel, ack_ref, caller, timer)
+    put(state.table, updated_channel)
 
     {:reply, {:ok, updated_channel}, state}
   end
@@ -336,7 +377,7 @@ defmodule Supabase.Realtime.Channel.Store do
     with {:ok, channel} <- find_channel_with_ack(state.table, ack_ref),
          {:ok, caller} <- Channel.get_ack_caller(channel, ack_ref) do
       updated_channel = Channel.remove_pending_ack(channel, ack_ref)
-      :ets.insert(state.table, {channel.ref, updated_channel, channel.topic, channel.join_ref})
+      put(state.table, updated_channel)
       {:reply, {:ok, caller}, state}
     else
       :error ->
@@ -350,7 +391,7 @@ defmodule Supabase.Realtime.Channel.Store do
     with {:ok, channel} <- find_channel_with_ack(state.table, ack_ref),
          {:ok, caller} <- Channel.get_ack_caller(channel, ack_ref) do
       updated_channel = Channel.remove_pending_ack(channel, ack_ref)
-      :ets.insert(state.table, {channel.ref, updated_channel, channel.topic, channel.join_ref})
+      put(state.table, updated_channel)
       {:reply, {:ok, caller}, state}
     else
       :error ->
@@ -369,8 +410,13 @@ defmodule Supabase.Realtime.Channel.Store do
 
   # Private helper functions
 
+  # Tuple shape: {ref, channel, topic, join_ref, leave_ref}
+  defp put(table, %Channel{} = channel) do
+    :ets.insert(table, {channel.ref, channel, channel.topic, channel.join_ref, channel.leave_ref})
+  end
+
   defp find_channel_with_ack(table, ack_ref) do
-    channels = :ets.select(table, [{{:_, :"$1", :_, :_}, [], [:"$1"]}])
+    channels = :ets.select(table, [{{:_, :"$1", :_, :_, :_}, [], [:"$1"]}])
 
     if channel =
          Enum.find(channels, fn channel ->

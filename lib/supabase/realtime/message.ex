@@ -26,7 +26,16 @@ defmodule Supabase.Realtime.Message do
       "{\"topic\":\"realtime:public\",\"event\":\"INSERT\",\"payload\":{},\"ref\":\"1\"}"
   """
   @spec encode(Realtime.realtime_message() | map()) :: {:ok, binary} | {:error, term}
-  def encode(message), do: Jason.encode(message)
+  def encode(message), do: encode_json(message)
+
+  # Native JSON has no tuple-returning encode/1, so the bang function is
+  # wrapped once here at the wire boundary. Callers keep the
+  # {:ok, _} | {:error, _} contract.
+  defp encode_json(term) do
+    {:ok, JSON.encode!(term)}
+  rescue
+    e -> {:error, {:encode_failed, e}}
+  end
 
   @doc """
   Decodes a message received from the Supabase Realtime server.
@@ -46,33 +55,87 @@ defmodule Supabase.Realtime.Message do
       {:ok, %{"topic" => "realtime:public", "event" => "INSERT", "payload" => %{}, "ref" => "1"}}
   """
   @spec decode(binary()) :: {:ok, map()} | {:error, term()}
-  def decode(data) when is_binary(data), do: Jason.decode(data)
+  def decode(data) when is_binary(data), do: JSON.decode(data)
 
   @doc """
   Constructs a subscription message for a channel.
 
+  The join payload carries a flat `postgres_changes` list built from the
+  channel bindings (never the binding struct keys), a `presence` config with
+  an `enabled` flag, and the resolved access token when non-nil. `ref` and
+  `join_ref` are added by the Connection (both set to the same fresh value).
+
   ## Parameters
 
   * `channel` - The channel struct
+  * `token` - The resolved access token, or nil to omit it
 
   ## Returns
 
   * `map` - Subscription message payload
   """
-  @spec subscription_message(Channel.t()) :: map()
-  def subscription_message(%Channel{} = channel) do
-    postgres_changes = Map.get(channel.bindings, "postgres_changes", [])
+  @spec subscription_message(Channel.t(), String.t() | nil) :: map()
+  def subscription_message(%Channel{} = channel, token) do
+    postgres_changes =
+      channel.bindings
+      |> Map.get("postgres_changes", [])
+      |> Enum.map(&postgres_binding_filter/1)
 
-    config = Map.put(channel.params.config, :postgres_changes, postgres_changes)
+    presence =
+      channel.params.config
+      |> Map.get(:presence, %{key: ""})
+      |> Map.put(:enabled, presence_enabled?(channel))
+
+    config =
+      channel.params.config
+      |> Map.put(:postgres_changes, postgres_changes)
+      |> Map.put(:presence, presence)
+
+    payload = %{config: config}
+    payload = if token, do: Map.put(payload, :access_token, token), else: payload
+
+    %{topic: channel.topic, event: "phx_join", payload: payload}
+  end
+
+  defp presence_enabled?(%Channel{} = channel) do
+    user_enabled =
+      channel.params.config
+      |> Map.get(:presence, %{})
+      |> Map.get(:enabled, false)
+
+    has_presence_bindings? =
+      channel.bindings
+      |> Map.get("presence", [])
+      |> length() > 0
+
+    user_enabled or has_presence_bindings?
+  end
+
+  # Flat server shape per binding, dropping nil keys. Never sends the binding
+  # struct keys (type/filter/callback/id).
+  defp postgres_binding_filter(binding) do
+    filter = binding.filter
 
     %{
-      topic: channel.topic,
-      event: "phx_join",
-      payload: %{
-        config: config
-      }
+      event: normalize_postgres_event(binding_filter_value(filter, :event)),
+      schema: binding_filter_value(filter, :schema),
+      table: binding_filter_value(filter, :table),
+      filter: binding_filter_value(filter, :filter)
     }
+    |> Enum.reject(fn {_key, value} -> is_nil(value) end)
+    |> Map.new()
   end
+
+  defp binding_filter_value(filter, key) when is_map(filter) do
+    Map.get(filter, key) || Map.get(filter, to_string(key))
+  end
+
+  # :all | "*" -> "*"; :insert | "insert" | "INSERT" -> "INSERT"; same for
+  # UPDATE/DELETE; anything else passes through String.upcase(to_string/1)
+  # (the server does no runtime validation either).
+  defp normalize_postgres_event(:all), do: "*"
+  defp normalize_postgres_event("*"), do: "*"
+  defp normalize_postgres_event(value), do: String.upcase(to_string(value))
 
   @doc """
   Constructs an unsubscribe message for a channel.
@@ -144,7 +207,9 @@ defmodule Supabase.Realtime.Message do
         event: event,
         payload: payload
       },
-      ack_ref: ack_ref
+      # under :ref so it survives encoding as the wire ref; the server echoes
+      # it back as the phx_reply ref
+      ref: ack_ref
     }
   end
 

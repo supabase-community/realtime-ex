@@ -56,6 +56,7 @@ defmodule Supabase.Realtime.Channel do
   * `bindings` - Event bindings for this channel
   * `state` - Current state of the channel
   * `join_ref` - Reference for the join message
+  * `leave_ref` - Reference of the in-flight phx_leave message
   * `timeout` - Timeout for operations in milliseconds
   * `params` - Additional parameters for the channel
   * `ref` - Unique reference for this channel
@@ -67,6 +68,7 @@ defmodule Supabase.Realtime.Channel do
           bindings: map(),
           state: Realtime.channel_state(),
           join_ref: Realtime.ref() | nil,
+          leave_ref: Realtime.ref() | nil,
           timeout: pos_integer(),
           params: map(),
           ref: String.t(),
@@ -78,6 +80,7 @@ defmodule Supabase.Realtime.Channel do
     :topic,
     :registry,
     :join_ref,
+    :leave_ref,
     :ref,
     bindings: %{},
     state: :closed,
@@ -180,6 +183,23 @@ defmodule Supabase.Realtime.Channel do
   @spec set_join_ref(t(), Realtime.ref()) :: t()
   def set_join_ref(%__MODULE__{} = channel, join_ref) when is_binary(join_ref) do
     %{channel | join_ref: join_ref}
+  end
+
+  @doc """
+  Sets the leave reference for the channel.
+
+  ## Parameters
+
+  * `channel` - The channel struct
+  * `leave_ref` - The leave reference
+
+  ## Returns
+
+  * `%Channel{}` - Updated channel struct
+  """
+  @spec set_leave_ref(t(), Realtime.ref()) :: t()
+  def set_leave_ref(%__MODULE__{} = channel, leave_ref) when is_binary(leave_ref) do
+    %{channel | leave_ref: leave_ref}
   end
 
   @doc """
@@ -342,22 +362,23 @@ defmodule Supabase.Realtime.Channel do
   @doc """
   Adds a pending acknowledgment to the channel.
 
+  Pure data only: the timeout timer is owned by the Connection, which passes
+  its timer reference in.
+
   ## Parameters
 
   * `channel` - The channel struct
   * `ack_ref` - The acknowledgment reference
   * `caller` - The process that will receive the acknowledgment
+  * `timer` - Timer reference owned by the Connection, or nil
 
   ## Returns
 
   * `%Channel{}` - Updated channel struct
   """
-  @spec add_pending_ack(t(), String.t(), pid()) :: t()
-  def add_pending_ack(%__MODULE__{} = channel, ack_ref, caller) do
-    ack_info = %{
-      caller: caller,
-      timer: Process.send_after(self(), {:ack_timeout, ack_ref}, channel.timeout)
-    }
+  @spec add_pending_ack(t(), String.t(), pid(), reference() | nil) :: t()
+  def add_pending_ack(%__MODULE__{} = channel, ack_ref, caller, timer) do
+    ack_info = %{caller: caller, timer: timer}
 
     %{channel | pending_acks: Map.put(channel.pending_acks, ack_ref, ack_info)}
   end

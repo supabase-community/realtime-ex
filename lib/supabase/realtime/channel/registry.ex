@@ -36,7 +36,7 @@ defmodule Supabase.Realtime.Channel.Registry do
   alias Supabase.Realtime
   alias Supabase.Realtime.Channel
   alias Supabase.Realtime.Channel.Store
-  alias Supabase.Realtime.Message
+  alias Supabase.Realtime.Connection
   alias Supabase.Realtime.PostgresTypes
 
   require Logger
@@ -104,6 +104,12 @@ defmodule Supabase.Realtime.Channel.Registry do
   @doc """
   Subscribes to events on a channel.
 
+  Returns `{:error, :already_joining}` / `{:error, :already_joined}` when a
+  `postgres_changes` or `presence` binding is added while the channel is
+  joining or joined (realtime-js semantics: these bindings are part of the
+  join payload, so they cannot be added after the join started). Broadcast
+  bindings are allowed at any time.
+
   ## Parameters
 
   * `server` - The server PID or name
@@ -112,7 +118,7 @@ defmodule Supabase.Realtime.Channel.Registry do
   * `filter` - The event filter
   """
   @spec subscribe(GenServer.server(), Channel.t(), String.t(), map() | keyword()) ::
-          :ok | {:error, term()}
+          :ok | {:error, :channel_not_found | :already_joined | :already_joining}
   def subscribe(server, %Channel{} = channel, type, filter) do
     GenServer.call(server, {:subscribe, channel, type, filter})
   end
@@ -193,9 +199,21 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   def handle_call({:subscribe, channel, type, filter}, _from, state) do
     case Store.find_by_ref(state.store, channel.ref) do
-      {:ok, found_channel} ->
-        {:ok, channel} = Store.add_binding(state.store, found_channel, type, filter)
-        {:reply, :ok, state, {:continue, {:join, channel}}}
+      # JS 2.101.0 behavior: adding these bindings after subscribe started is a
+      # hard error, not a silent drop
+      {:ok, found} when found.state in [:joining, :joined] and type in ["postgres_changes", "presence"] ->
+        error = if found.state == :joined, do: :already_joined, else: :already_joining
+        {:reply, {:error, error}, state}
+
+      {:ok, found} ->
+        {:ok, updated} = Store.add_binding(state.store, found, type, filter)
+
+        if updated.state in [:closed, :errored] do
+          {:reply, :ok, state, {:continue, {:join, updated}}}
+        else
+          # broadcast bindings on a joining/joined channel
+          {:reply, :ok, state}
+        end
 
       {:error, :not_found} ->
         {:reply, {:error, :channel_not_found}, state}
@@ -227,33 +245,47 @@ defmodule Supabase.Realtime.Channel.Registry do
   def handle_cast({:connection_state_changed, old, new}, state) do
     channels = Store.all(state.store)
     dispatch_event(state, channels, {:connection, :state_change, %{old: old, new: new}})
+
+    if new == :open do
+      rejoin_channels(state)
+    end
+
     {:noreply, state}
   end
 
-  def handle_cast({:handle_message, %{"event" => event, "payload" => payload} = msg}, state) do
-    matching_channels = Store.find_all_by_topic(state.store, msg["topic"])
-
-    case event do
-      "phx_close" -> handle_leave(msg, state)
-      "phx_reply" -> handle_reply(msg, state)
-      _ -> handle_event(matching_channels, event, payload, state)
-    end
+  def handle_cast({:handle_message, %{"event" => event} = msg}, state) do
+    dispatch_message(event, msg, state)
   end
 
   @impl true
   def handle_continue({:join, channel}, state) do
-    if not Channel.joined?(channel) and not Channel.joining?(channel) do
-      Logger.debug("[#{channel.topic}] Joining #{channel.ref}")
+    if channel.state in [:closed, :errored] do
       {:ok, channel} = Store.update_state(state.store, channel, :joining)
-      state.module.send_message(channel, Message.subscription_message(channel))
+
+      if state.connection do
+        Connection.join_channel(state.connection, channel)
+      else
+        Logger.debug("no connection; join deferred until :open sweep")
+      end
     end
 
     {:noreply, state}
   end
 
   def handle_continue({:leave, channel}, state) do
-    Logger.debug("[#{channel.topic}] Leaving #{channel.ref}")
-    state.module.send_message(channel, Message.unsubscribe_message(channel))
+    result =
+      if state.connection do
+        Connection.leave_channel(state.connection, channel)
+      else
+        {:error, :not_connected}
+      end
+
+    case result do
+      # the server lost every channel on disconnect, so the leave is complete
+      # locally; on :ok the stored leave_ref waits for the phx_reply / phx_close
+      {:error, :not_connected} -> Store.remove(state.store, channel)
+      :ok -> :ok
+    end
 
     {:noreply, state}
   end
@@ -268,86 +300,176 @@ defmodule Supabase.Realtime.Channel.Registry do
     end
   end
 
-  defp handle_leave(%{"ref" => join_ref, "topic" => topic} = msg, state) do
-    %{"payload" => %{"status" => status}} = msg
+  # Rejoin sweep on :open: every channel that was joining, joined or errored
+  # gets a fresh join (fresh join_ref, fresh token); leaves that were in
+  # flight when the connection died are complete locally.
+  defp rejoin_channels(state) do
+    if state.connection do
+      for channel <- Store.all(state.store), channel.state in [:joining, :joined, :errored] do
+        {:ok, ch} = Store.update_state(state.store, channel, :joining)
+        Connection.join_channel(state.connection, ch)
+      end
+    end
 
-    case Store.find_by_join_ref(state.store, join_ref) do
+    for channel <- Store.all(state.store), channel.state == :leaving do
+      Store.remove(state.store, channel)
+    end
+  end
+
+  defp handle_phx_close(topic, state) do
+    # the wire payload is empty (%{}); remove the channel by topic
+    case Store.find_by_topic(state.store, topic) do
       {:ok, channel} ->
-        handle_channel_leaving(channel, status, state)
+        Logger.debug("[#{topic}] Channel closed by server")
+        Store.remove(state.store, channel)
 
       {:error, :not_found} ->
-        Logger.debug("[#{topic}] Channel not found for leave message with ref #{join_ref}")
+        Logger.debug("[#{topic}] Channel not found for close message")
     end
 
     {:noreply, state}
   end
 
-  defp handle_channel_leaving(channel, "ok", state) when channel.state == :leaving do
-    Logger.debug("[#{channel.topic}] Successfully left #{channel.ref}")
-    Store.remove(state.store, channel)
-  end
-
-  defp handle_channel_leaving(channel, "ok", _state) do
-    Logger.debug("[#{channel.topic}] Ignoring leave message for #{channel.ref} with status ok")
-  end
-
-  defp handle_channel_leaving(channel, status, state) when status in ~w(error timeout) do
-    Logger.error("[#{channel.topic}] Failed to leave channel #{channel.ref}: #{status}")
-    Store.update_state(state.store, channel, :errored)
-  end
-
-  defp handle_channel_leaving(channel, status, _state) do
-    Logger.debug("[#{channel.topic}] Ignoring leave message for #{channel.ref} with status #{status}")
-  end
-
-  defp handle_reply(%{"ref" => join_ref} = msg, state) do
-    %{"payload" => %{"status" => status} = payload} = msg
-
-    case Store.find_by_join_ref(state.store, join_ref) do
+  defp handle_phx_error(topic, state) do
+    case Store.find_by_topic(state.store, topic) do
       {:ok, channel} ->
-        handle_channel_reply(channel, status, state)
-        maybe_update_binding_ids(channel, payload, state)
+        Logger.error("[#{topic}] Server sent phx_error, marking channel errored")
+        Store.update_state(state.store, channel, :errored)
 
       {:error, :not_found} ->
-        Logger.debug("Channel not found for reply message with ref #{join_ref}")
+        Logger.debug("[#{topic}] Channel not found for error message")
     end
 
     {:noreply, state}
   end
 
-  defp handle_channel_reply(channel, "ok", state) do
+  defp handle_reply(%{"ref" => ref} = msg, state) do
+    status = get_in(msg, ["payload", "status"])
+    payload = get_in(msg, ["payload"]) || %{}
+
+    case find_reply_target(state.store, ref) do
+      {:join, channel} -> handle_join_reply(channel, status, payload, state)
+      {:leave, channel} -> handle_leave_reply(channel, status, state)
+      :ignore -> Logger.debug("[#{__MODULE__}]: Ignoring phx_reply for unknown ref: #{inspect(ref)}")
+    end
+
+    {:noreply, state}
+  end
+
+  defp find_reply_target(store, ref) do
+    case Store.find_by_join_ref(store, ref) do
+      {:ok, channel} ->
+        {:join, channel}
+
+      {:error, _} ->
+        case Store.find_by_leave_ref(store, ref) do
+          {:ok, channel} -> {:leave, channel}
+          {:error, _} -> :ignore
+        end
+    end
+  end
+
+  defp handle_join_reply(channel, "ok", payload, state) do
     Logger.debug("[#{channel.topic}] Successfully joined #{channel.ref}")
-    Store.update_state(state.store, channel, :joined)
+    {:ok, joined} = Store.update_state(state.store, channel, :joined)
+    maybe_update_binding_ids(joined, payload, state)
 
     if state.connection do
       GenServer.cast(state.connection, {:channel_joined, channel.topic})
     end
   end
 
-  defp handle_channel_reply(channel, status, state) when status in ~w(error timeout) do
-    Logger.error("[#{channel.topic}] Failed to join channel #{channel.ref}: #{status}")
+  defp handle_join_reply(channel, status, payload, state) when status in ~w(error timeout) do
+    reason = get_in(payload, ["response", "reason"])
+    Logger.error("[#{channel.topic}] Failed to join channel #{channel.ref}: #{status} #{reason}")
     Store.update_state(state.store, channel, :errored)
   end
 
-  defp handle_channel_reply(channel, status, _state) do
-    Logger.debug("[#{channel.topic}] Ignoring reply message for #{channel.ref} with status #{status}")
+  defp handle_join_reply(channel, status, _payload, _state) do
+    Logger.debug("[#{channel.topic}] Ignoring join reply with status #{inspect(status)}")
   end
 
-  defp handle_event(channels, event, payload, state) when is_database_event(event) do
-    db_event_type = event |> String.downcase() |> String.to_atom()
-    matching = filter_by_server_ids(channels, payload)
-    transformed_payload = transform_db_payload(payload)
-    dispatch_event(state, matching, {:postgres_changes, db_event_type, transformed_payload})
+  defp handle_leave_reply(channel, "ok", state) do
+    Logger.debug("[#{channel.topic}] Successfully left #{channel.ref}")
+    Store.remove(state.store, channel)
+  end
+
+  defp handle_leave_reply(channel, status, state) when status in ~w(error timeout) do
+    Logger.error("[#{channel.topic}] Failed to leave channel #{channel.ref}: #{status}")
+    Store.update_state(state.store, channel, :errored)
+  end
+
+  defp handle_leave_reply(channel, status, _state) do
+    Logger.debug("[#{channel.topic}] Ignoring leave reply with status #{inspect(status)}")
+  end
+
+  defp handle_postgres_changes(channels, payload, state) do
+    ids = Map.get(payload, "ids", [])
+    data = Map.get(payload, "data", %{})
+
+    matching =
+      Enum.filter(channels, fn channel ->
+        channel.bindings
+        |> Map.get("postgres_changes", [])
+        |> Enum.any?(&(&1.id in ids))
+      end)
+
+    case postgres_op(data["type"]) do
+      nil ->
+        Logger.error("[#{__MODULE__}]: Ignoring postgres_changes with unknown type: #{inspect(data["type"])}")
+        {:noreply, state}
+
+      op ->
+        dispatch_event(state, matching, {:postgres_changes, op, transform_db_payload(data)})
+        {:noreply, state}
+    end
+  end
+
+  defp postgres_op(type) when is_binary(type) do
+    case String.downcase(type) do
+      "*" -> :all
+      "insert" -> :insert
+      "update" -> :update
+      "delete" -> :delete
+      _other -> nil
+    end
+  end
+
+  defp postgres_op(_type), do: nil
+
+  defp handle_broadcast(channels, payload, state) do
+    name = Map.get(payload, "event")
+    user_payload = Map.get(payload, "payload", %{})
+
+    matching =
+      if is_binary(name) do
+        Enum.filter(channels, fn channel ->
+          channel.bindings
+          |> Map.get("broadcast", [])
+          |> Enum.any?(&broadcast_binding_matches?(&1, name))
+        end)
+      else
+        []
+      end
+
+    dispatch_event(state, matching, {:broadcast, name, user_payload})
     {:noreply, state}
   end
 
-  defp handle_event(channels, "presence_state", payload, state) do
+  defp broadcast_binding_matches?(%{filter: filter}, name) do
+    filter_event = Map.get(filter, :event) || Map.get(filter, "event")
+
+    filter_event == "*" or
+      String.downcase(to_string(filter_event)) == String.downcase(name)
+  end
+
+  defp handle_presence_state(channels, payload, state) do
     new_state = %{state | presence_state: Map.get(payload, "state", %{})}
     dispatch_event(new_state, channels, {:presence, :sync, new_state.presence_state})
     {:noreply, new_state}
   end
 
-  defp handle_event(channels, "presence_diff", payload, state) do
+  defp handle_presence_diff(channels, payload, state) do
     joins = Map.get(payload, "joins", %{})
     leaves = Map.get(payload, "leaves", %{})
 
@@ -370,19 +492,6 @@ defmodule Supabase.Realtime.Channel.Registry do
     {:noreply, new_state}
   end
 
-  defp handle_event(channels, _event, %{"type" => "presence", "event" => presence_event, "payload" => payload}, state) do
-    # Handle presence events from message payload
-    presence_type = String.to_atom(presence_event)
-    dispatch_event(state, channels, {:presence, presence_type, payload})
-    {:noreply, state}
-  end
-
-  defp handle_event(channels, event, payload, state) do
-    matching = filter_by_event(channels, "broadcast", event)
-    dispatch_event(state, matching, {:broadcast, event, payload})
-    {:noreply, state}
-  end
-
   defp transform_db_payload(payload) do
     columns = Map.get(payload, "columns", [])
 
@@ -397,30 +506,6 @@ defmodule Supabase.Realtime.Channel.Registry do
       record -> Map.put(payload, key, PostgresTypes.transform(record, columns))
     end
   end
-
-  defp filter_by_server_ids(channels, payload) do
-    case get_in(payload, ["ids"]) do
-      nil -> channels
-      [] -> channels
-      server_ids -> Enum.filter(channels, &channel_matches_ids?(&1, server_ids))
-    end
-  end
-
-  defp channel_matches_ids?(channel, server_ids) do
-    bindings = Map.get(channel.bindings, "postgres_changes", [])
-    bindings == [] or Enum.any?(bindings, fn b -> b.id in server_ids end)
-  end
-
-  defp filter_by_event(channels, binding_type, event) do
-    Enum.filter(channels, fn channel ->
-      bindings = Map.get(channel.bindings, binding_type, [])
-      bindings == [] or Enum.any?(bindings, &event_matches?(&1, event))
-    end)
-  end
-
-  defp event_matches?(%{filter: %{event: "*"}}, _event), do: true
-  defp event_matches?(%{filter: %{event: filter_event}}, event), do: filter_event == event
-  defp event_matches?(_, _), do: true
 
   defp maybe_update_binding_ids(channel, %{"response" => %{"postgres_changes" => server_bindings}}, state)
        when is_list(server_bindings) do
@@ -445,6 +530,40 @@ defmodule Supabase.Realtime.Channel.Registry do
   defp maybe_update_binding_ids(_channel, _payload, _state), do: :ok
 
   # Helper to dispatch events to the callback module if available
+  # Wire-event dispatch. One function head per event keeps each clause's
+  # cyclomatic complexity flat as the event table grows.
+  defp dispatch_message("phx_close", msg, state), do: handle_phx_close(msg_topic(msg), state)
+
+  defp dispatch_message("phx_error", msg, state), do: handle_phx_error(msg_topic(msg), state)
+
+  defp dispatch_message("phx_reply", msg, state), do: handle_reply(msg, state)
+
+  defp dispatch_message("postgres_changes", msg, state),
+    do: handle_postgres_changes(topic_channels(msg, state), msg_payload(msg), state)
+
+  defp dispatch_message("broadcast", msg, state),
+    do: handle_broadcast(topic_channels(msg, state), msg_payload(msg), state)
+
+  defp dispatch_message("presence_state", msg, state),
+    do: handle_presence_state(topic_channels(msg, state), msg_payload(msg), state)
+
+  defp dispatch_message("presence_diff", msg, state),
+    do: handle_presence_diff(topic_channels(msg, state), msg_payload(msg), state)
+
+  defp dispatch_message("system", msg, state) do
+    Logger.debug("[#{__MODULE__}]: Ignoring system message: #{inspect(msg_payload(msg))}")
+    {:noreply, state}
+  end
+
+  defp dispatch_message(event, _msg, state) do
+    Logger.debug("[#{__MODULE__}]: Ignoring unknown event: #{inspect(event)}")
+    {:noreply, state}
+  end
+
+  defp msg_topic(msg), do: Map.get(msg, "topic")
+  defp msg_payload(msg), do: Map.get(msg, "payload", %{})
+  defp topic_channels(msg, state), do: Store.find_all_by_topic(state.store, msg_topic(msg))
+
   defp dispatch_event(state, channels, event) do
     if channels != [] and function_exported?(state.module, :handle_event, 1) do
       Task.start(fn ->
