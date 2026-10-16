@@ -205,6 +205,94 @@ defmodule Supabase.Realtime.JoinFlowTest do
       assert rejoin["payload"]["access_token"] == "tok2"
     end
 
+    test "duplicate postgres binding never reaches the join payload", ctx do
+      {:ok, channel} = Registry.create_channel(ctx.registry, "public:users")
+      {conn, stream_ref} = start_connection(ctx)
+      wait_connection_open()
+
+      filter = %{event: :insert, schema: "public", table: "users"}
+
+      :ok = Registry.subscribe(ctx.registry, channel, "postgres_changes", filter)
+
+      assert_receive {:ws_frame, {:text, join1_json}}, 1000
+      join1 = JSON.decode!(join1_json)
+
+      # force :errored by replying an error to the join
+      send_join_error(conn, stream_ref, channel, join1["ref"])
+      wait_for_state(ctx, channel, :errored)
+
+      assert {:error, :duplicate_binding} = Registry.subscribe(ctx.registry, channel, "postgres_changes", filter)
+
+      # drive a fresh connection: the :open sweep rejoins the errored channel
+      send(conn, {:gun_down, self(), :http, :closed, []})
+      Process.sleep(20)
+      send(conn, :reconnect)
+      Process.sleep(20)
+      send(conn, {:gun_up, self(), :http})
+      Process.sleep(20)
+
+      current_ref = :sys.get_state(conn).stream_ref
+      send(conn, {:gun_upgrade, self(), current_ref, ["websocket"], []})
+
+      assert_receive {:ws_frame, {:text, rejoin_json}}, 1000
+      rejoin = JSON.decode!(rejoin_json)
+
+      assert rejoin["event"] == "phx_join"
+      assert length(rejoin["payload"]["config"]["postgres_changes"]) == 1
+    end
+
+    test "two distinct postgres bindings: oldest-first in the join payload and aligned server ids", ctx do
+      {conn, stream_ref} = start_connection(ctx)
+      {:ok, channel} = Registry.create_channel(ctx.registry, "public:users")
+
+      :ok =
+        Registry.subscribe(ctx.registry, channel, "postgres_changes", %{
+          event: :insert,
+          schema: "public",
+          table: "users"
+        })
+
+      assert_receive {:ws_frame, {:text, join1_json}}, 1000
+      join1 = JSON.decode!(join1_json)
+
+      # force :errored so the second binding can be added
+      send_join_error(conn, stream_ref, channel, join1["ref"])
+      Process.sleep(30)
+
+      :ok =
+        Registry.subscribe(ctx.registry, channel, "postgres_changes", %{
+          event: :update,
+          schema: "public",
+          table: "posts"
+        })
+
+      assert_receive {:ws_frame, {:text, join2_json}}, 1000
+      join2 = JSON.decode!(join2_json)
+
+      # the wire list is oldest-first (realtime-js parity): the first
+      # subscribed binding comes first, which keeps the server's positional
+      # binding ids aligned with the stored bindings
+      assert join2["payload"]["config"]["postgres_changes"] == [
+               %{"event" => "INSERT", "schema" => "public", "table" => "users"},
+               %{"event" => "UPDATE", "schema" => "public", "table" => "posts"}
+             ]
+
+      # the server echoes bindings in payload order
+      send_join_ok(conn, stream_ref, channel, join2["ref"], [
+        %{"id" => 1, "event" => "INSERT", "schema" => "public", "table" => "users"},
+        %{"id" => 2, "event" => "UPDATE", "schema" => "public", "table" => "posts"}
+      ])
+
+      Process.sleep(50)
+
+      {:ok, stored} = Store.find_by_ref(ctx.store, channel.ref)
+
+      # alignment, not just set membership: each binding holds the id of
+      # ITS subscription
+      by_event = Map.new(stored.bindings["postgres_changes"], fn binding -> {binding.filter.event, binding.id} end)
+      assert by_event == %{insert: 1, update: 2}
+    end
+
     test "incoming postgres_changes dispatches with transformed record", ctx do
       {conn, stream_ref} = start_connection(ctx)
       {:ok, channel} = Registry.create_channel(ctx.registry, "public:users")
@@ -543,6 +631,38 @@ defmodule Supabase.Realtime.JoinFlowTest do
 
   # Helpers
 
+  # The :open sweep re-joins channels in :joining/:joined/:errored, so a
+  # subscribe racing the :open notification would be joined twice (the
+  # sweep's join supersedes the first frame's join_ref). Creating the
+  # channel before the connection opens and waiting for the dispatched :open
+  # state change makes the subscribe strictly post-sweep.
+  defp wait_connection_open do
+    assert_receive {:dispatched, {:connection, :state_change, %{new: :open}}}, 1000
+  end
+
+  # The error reply travels gun_ws -> Connection -> Registry cast; poll the
+  # Store for the resulting state instead of sleeping a fixed interval.
+  defp wait_for_state(ctx, channel, expected) do
+    deadline = System.monotonic_time(:millisecond) + 1000
+    do_wait_for_state(ctx, channel, expected, deadline)
+  end
+
+  defp do_wait_for_state(ctx, channel, expected, deadline) do
+    {:ok, stored} = Store.find_by_ref(ctx.store, channel.ref)
+
+    cond do
+      stored.state == expected ->
+        stored
+
+      System.monotonic_time(:millisecond) >= deadline ->
+        flunk("channel did not reach #{inspect(expected)}, still #{inspect(stored.state)}")
+
+      true ->
+        Process.sleep(2)
+        do_wait_for_state(ctx, channel, expected, deadline)
+    end
+  end
+
   defp start_connection(ctx) do
     test = self()
     stream_ref = make_ref()
@@ -579,6 +699,17 @@ defmodule Supabase.Realtime.JoinFlowTest do
       "event" => "phx_reply",
       "ref" => join_ref,
       "payload" => %{"status" => "ok", "response" => %{"postgres_changes" => server_bindings}}
+    }
+
+    send(conn, {:gun_ws, self(), stream_ref, {:text, JSON.encode!(reply)}})
+  end
+
+  defp send_join_error(conn, stream_ref, channel, join_ref) do
+    reply = %{
+      "topic" => channel.topic,
+      "event" => "phx_reply",
+      "ref" => join_ref,
+      "payload" => %{"status" => "error", "response" => %{"reason" => "unauthorized"}}
     }
 
     send(conn, {:gun_ws, self(), stream_ref, {:text, JSON.encode!(reply)}})

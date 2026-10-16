@@ -63,6 +63,10 @@ defmodule Supabase.Realtime.Message do
   an `enabled` flag, and the resolved access token when non-nil. `ref` and
   `join_ref` are added by the Connection (both set to the same fresh value).
 
+  Bindings are stored newest-first; the wire `postgres_changes` list is
+  emitted oldest-first (realtime-js parity), which keeps the server's
+  positional binding ids aligned with the stored bindings.
+
   ## Parameters
 
   * `channel` - The channel struct
@@ -77,6 +81,9 @@ defmodule Supabase.Realtime.Message do
     postgres_changes =
       channel.bindings
       |> Map.get("postgres_changes", [])
+      # add_binding prepends (newest-first); the wire list is oldest-first
+      # (realtime-js parity) so the server's positional binding ids align
+      |> Enum.reverse()
       |> Enum.map(&postgres_binding_filter/1)
 
     presence =
