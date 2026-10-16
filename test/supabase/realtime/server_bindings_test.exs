@@ -56,6 +56,11 @@ defmodule Supabase.Realtime.ServerBindingsTest do
       ids = Enum.map(bindings, & &1.id)
       assert 1 in ids
       assert 2 in ids
+
+      # alignment, not just membership: each binding holds the id of ITS
+      # subscription (the reverse-zip treats the server list as oldest-first)
+      by_event = Map.new(bindings, fn binding -> {binding.filter.event, binding.id} end)
+      assert by_event == %{"INSERT" => 1, "UPDATE" => 2}
     end
 
     test "ignores reply without postgres_changes response", ctx do

@@ -416,4 +416,56 @@ defmodule Supabase.Realtime.ChannelTest do
                {:ok, %{event: "new_message", select: []}}
     end
   end
+
+  describe "same_postgres_filter?/2" do
+    # all inputs below are normalize_filter/2 output (Filter built to a
+    # string, select already validated), per the function's precondition
+    test "identical normalized filters are duplicates" do
+      filter = %{event: "INSERT", schema: "public", table: "users", filter: "id=eq.1"}
+
+      assert Channel.same_postgres_filter?(filter, %{event: "INSERT", schema: "public", table: "users", filter: "id=eq.1"})
+    end
+
+    test "each single-field difference is not a duplicate" do
+      base = %{event: "INSERT", schema: "public", table: "users", filter: "id=eq.1", select: ["id"]}
+
+      refute Channel.same_postgres_filter?(base, %{base | event: "UPDATE"})
+      refute Channel.same_postgres_filter?(base, %{base | schema: "private"})
+      refute Channel.same_postgres_filter?(base, %{base | table: "posts"})
+      refute Channel.same_postgres_filter?(base, %{base | filter: "id=eq.2"})
+      refute Channel.same_postgres_filter?(base, %{base | select: ["name"]})
+    end
+
+    test "nil vs missing keys compare equal" do
+      assert Channel.same_postgres_filter?(
+               %{event: "INSERT", schema: "public"},
+               %{event: "INSERT", schema: "public", table: nil, filter: nil, select: nil}
+             )
+    end
+
+    test "select is order-sensitive (JS join parity)" do
+      base = %{event: "*", schema: "public", select: ["a", "b"]}
+
+      assert Channel.same_postgres_filter?(base, %{base | select: ["a", "b"]})
+      refute Channel.same_postgres_filter?(base, %{base | select: ["b", "a"]})
+    end
+
+    test "select presence vs absence is not a duplicate" do
+      base = %{event: "*", schema: "public"}
+
+      # an explicit nil select is the same binding as an absent one
+      assert Channel.same_postgres_filter?(base, Map.put(base, :select, nil))
+
+      with_select = Map.put(base, :select, ["id"])
+      refute Channel.same_postgres_filter?(base, with_select)
+      refute Channel.same_postgres_filter?(with_select, base)
+    end
+
+    test "id is not compared: two maps differing only in id are duplicates" do
+      assert Channel.same_postgres_filter?(
+               %{event: "INSERT", schema: "public", table: "users", id: 1},
+               %{event: "INSERT", schema: "public", table: "users", id: 106_243_155}
+             )
+    end
+  end
 end

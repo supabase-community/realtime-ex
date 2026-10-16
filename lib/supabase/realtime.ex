@@ -102,11 +102,7 @@ defmodule Supabase.Realtime do
 
   ## Broadcast Messages
 
-      :ok = MyApp.Realtime.send(channel, %{
-        type: "broadcast",
-        event: "new_message",
-        payload: %{text: "Hello!"}
-      })
+      :ok = MyApp.Realtime.broadcast(channel, "new_message", %{text: "Hello!"})
 
   ## Wildcard Events
 
@@ -130,6 +126,9 @@ defmodule Supabase.Realtime do
   * `:heartbeat_interval` - Milliseconds between heartbeats (default: 25000).
   * `:reconnect_after_ms` - A function that receives the attempt count and returns
     a delay in milliseconds. Defaults to stepped backoff (1s, 2s, 5s, 10s).
+  * `:rejoin_after_ms` - A function that receives the try count and returns the
+    per-channel rejoin delay in milliseconds. Defaults to stepped backoff
+    (1s, 2s, 5s, then 10s).
   * `:http_fallback` - When `true`, broadcast messages are sent over HTTP
     if the WebSocket connection is down (default: false).
   * `:access_token_fn` - A zero-arity function or `{mod, fun, args}` tuple
@@ -223,7 +222,11 @@ defmodule Supabase.Realtime do
   @type event_type :: :postgres_changes | :broadcast | :presence
   @type event_filter :: Enumerable.t()
   @type channel_opts :: keyword()
-  @type start_option :: {:name, atom()} | {:client, Supabase.Client.t()} | {:timeout, pos_integer()}
+  @type start_option ::
+          {:name, atom()}
+          | {:client, Supabase.Client.t()}
+          | {:timeout, pos_integer()}
+          | {:rejoin_after_ms, (pos_integer() -> pos_integer())}
   @typedoc """
   Types of PostgreSQL database changes.
 
@@ -354,6 +357,8 @@ defmodule Supabase.Realtime do
   * `:timeout` - Connection timeout in milliseconds (default: 10000).
   * `:heartbeat_interval` - Milliseconds between heartbeats (default: 25000).
   * `:reconnect_after_ms` - Function that receives attempt count and returns delay in ms.
+  * `:rejoin_after_ms` - Function that receives the try count and returns the
+    per-channel rejoin delay in ms (default: stepped 1s, 2s, 5s, 10s).
   * `:http_fallback` - Send broadcasts over HTTP when WebSocket is down (default: false).
   * `:access_token_fn` - Zero-arity function returning `{:ok, token}` for token refresh.
   * `:tls_opts` - Keyword list merged over the default TLS options.
@@ -426,6 +431,10 @@ defmodule Supabase.Realtime do
     bindings are allowed at any time.
   * `{:error, :invalid_select}` - A `postgres_changes` `select:` was given
     that is not a non-empty list of column names
+  * `{:error, :duplicate_binding}` - A `postgres_changes` binding identical
+    (event, schema, table, filter, select) to one already on this channel.
+    The server collapses identical filters into a single subscription, so a
+    duplicate would desync the client's positional binding ids.
   """
   @spec on(channel(), String.t(), event_filter()) :: :ok | {:error, term()}
   def on(%Channel{} = channel, type, filter) when is_binary(type) and (is_list(filter) or is_map(filter)) do
@@ -445,7 +454,14 @@ defmodule Supabase.Realtime do
 
   ## Examples
 
-      Realtime.send(channel, type: "broadcast", event: "new_message", payload: %{body: "Hello"})
+      # raw path: the payload's `:event` and `:payload` keys become the
+      # wire `event` and `payload` fields
+      Realtime.send(conn, channel, %{event: "custom_event", payload: %{body: "Hello"}})
+
+      # for broadcasts use broadcast/4, which wraps the payload in the
+      # %{type: "broadcast", event: ..., payload: ...} envelope the
+      # server expects
+      Realtime.broadcast(conn, channel, "new_message", %{body: "Hello"})
   """
   @spec send(pid | module, channel(), map()) :: :ok | {:error, term()}
   def send(conn, %Channel{} = channel, payload) when is_map(payload) do
@@ -767,6 +783,7 @@ defmodule Supabase.Realtime do
         registry_name = Module.concat(module, Registry)
         conn_name = Module.concat(module, Connection)
         reconnect_after_ms = opts[:reconnect_after_ms]
+        rejoin_after_ms = opts[:rejoin_after_ms]
         http_fallback = opts[:http_fallback] || false
         access_token_fn = opts[:access_token_fn]
         tls_opts = opts[:tls_opts]
@@ -775,7 +792,12 @@ defmodule Supabase.Realtime do
         children =
           [
             {Channel.Store, name: store_name},
-            {Channel.Registry, module: module, name: registry_name, store: store_name, connection: conn_name},
+            {Channel.Registry,
+             module: module,
+             name: registry_name,
+             store: store_name,
+             connection: conn_name,
+             rejoin_after_ms: rejoin_after_ms},
             {Realtime.Connection,
              name: conn_name,
              registry: registry_name,
@@ -849,7 +871,7 @@ defmodule Supabase.Realtime do
       defdelegate on(channel, type, filter), to: Realtime
 
       @doc """
-      Check `Supabase.Realtime.send/2` for more information.
+      Check `Supabase.Realtime.send/3` for more information.
       """
       def send(channel, payload) do
         with {:ok, conn} <- Realtime.fetch_connection(__MODULE__) do

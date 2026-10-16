@@ -39,6 +39,7 @@ defmodule Supabase.Realtime.Channel.Registry do
   alias Supabase.Realtime.Connection
   alias Supabase.Realtime.PostgresTypes
   alias Supabase.Realtime.Presence
+  alias Supabase.Realtime.Rejoin
 
   require Logger
 
@@ -50,7 +51,9 @@ defmodule Supabase.Realtime.Channel.Registry do
           pending_events: list(),
           presence_state: map(),
           store: pid() | module(),
-          connection: pid() | module() | nil
+          connection: pid() | module() | nil,
+          rejoin_timers: Rejoin.timers(),
+          rejoin_after_ms: Rejoin.after_ms()
         }
 
   # Client API
@@ -64,6 +67,9 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   * `:name` - Optional registration name
   * `:module` - The callback module for event handling
+  * `:rejoin_after_ms` - A function that receives the try count and returns
+    the per-channel rejoin delay in milliseconds (default: stepped 1s, 2s,
+    5s, then 10s)
   """
   @spec start_link(keyword()) :: GenServer.on_start()
   def start_link(opts) do
@@ -71,8 +77,11 @@ defmodule Supabase.Realtime.Channel.Registry do
     module = Keyword.fetch!(opts, :module)
     store = Keyword.fetch!(opts, :store)
     connection = opts[:connection]
+    rejoin_after_ms = opts[:rejoin_after_ms]
 
-    GenServer.start_link(__MODULE__, %{module: module, store: store, connection: connection}, name: name)
+    init_arg = %{module: module, store: store, connection: connection, rejoin_after_ms: rejoin_after_ms}
+
+    GenServer.start_link(__MODULE__, init_arg, name: name)
   end
 
   @doc """
@@ -124,7 +133,8 @@ defmodule Supabase.Realtime.Channel.Registry do
   * `filter` - The event filter
   """
   @spec subscribe(GenServer.server(), Channel.t(), String.t(), map() | keyword()) ::
-          :ok | {:error, :channel_not_found | :already_joined | :already_joining | :invalid_select}
+          :ok
+          | {:error, :channel_not_found | :already_joined | :already_joining | :invalid_select | :duplicate_binding}
   def subscribe(server, %Channel{} = channel, type, filter) do
     GenServer.call(server, {:subscribe, channel, type, filter})
   end
@@ -176,7 +186,9 @@ defmodule Supabase.Realtime.Channel.Registry do
       store: init_arg.store,
       connection: init_arg[:connection],
       pending_events: [],
-      presence_state: %{}
+      presence_state: %{},
+      rejoin_timers: %{},
+      rejoin_after_ms: init_arg[:rejoin_after_ms] || (&Rejoin.default_after_ms/1)
     }
 
     {:ok, state}
@@ -222,6 +234,8 @@ defmodule Supabase.Realtime.Channel.Registry do
   def handle_call({:unsubscribe, channel}, _from, state) do
     case Store.find_by_ref(state.store, channel.ref) do
       {:ok, found_channel} ->
+        # phoenix leave() resets the rejoin timer
+        state = cancel_rejoin(state, found_channel.ref)
         {:ok, channel} = Store.update_state(state.store, found_channel, :leaving)
         {:reply, :ok, state, {:continue, {:leave, channel}}}
 
@@ -245,22 +259,36 @@ defmodule Supabase.Realtime.Channel.Registry do
   defp subscribe_binding(found, type, filter, state) do
     case Channel.normalize_filter(type, filter) do
       {:ok, filter} ->
-        {:ok, updated} = Store.add_binding(state.store, found, type, filter)
-
-        if updated.state in [:closed, :errored] do
-          {:reply, :ok, state, {:continue, {:join, updated}}}
-        else
-          # broadcast bindings on a joining/joined channel
-          {:reply, :ok, state}
-        end
+        store_binding(found, type, filter, state)
 
       {:error, :invalid_select} ->
         {:reply, {:error, :invalid_select}, state}
     end
   end
 
+  defp store_binding(found, type, filter, state) do
+    if type == "postgres_changes" and duplicate_postgres_binding?(found, filter) do
+      # the server collapses identical filters into a single subscription;
+      # a duplicate would desync the client's positional binding ids
+      {:reply, {:error, :duplicate_binding}, state}
+    else
+      {:ok, updated} = Store.add_binding(state.store, found, type, filter)
+
+      if updated.state in [:closed, :errored] do
+        {:reply, :ok, state, {:continue, {:join, updated}}}
+      else
+        # broadcast bindings on a joining/joined channel
+        {:reply, :ok, state}
+      end
+    end
+  end
+
   @impl true
   def handle_cast({:connection_state_changed, old, new}, state) do
+    # phoenix resets every channel rejoin timer on any socket state change;
+    # socket-level recovery owns rejoining while down, and the :open sweep
+    # below re-joins errored channels fresh
+    state = clear_rejoins(state)
     channels = Store.all(state.store)
     dispatch_event(state, channels, {:connection, :state_change, %{old: old, new: new}})
 
@@ -278,6 +306,9 @@ defmodule Supabase.Realtime.Channel.Registry do
   @impl true
   def handle_continue({:join, channel}, state) do
     if channel.state in [:closed, :errored] do
+      # the in-flight join replaces the pending retry; if it fails, the
+      # failure path arms a fresh one
+      state = cancel_rejoin(state, channel.ref)
       {:ok, channel} = Store.update_state(state.store, channel, :joining)
 
       if state.connection do
@@ -308,6 +339,23 @@ defmodule Supabase.Realtime.Channel.Registry do
     {:noreply, state}
   end
 
+  # Per-channel rejoin timer fire. A stale token (no entry, or the entry
+  # holds a newer arm's token) is a zombie from a cancelled arm: no-op. A
+  # valid fire retries the join on its own when the channel is :errored and
+  # the connection process is up; otherwise the entry is dropped (the :open
+  # sweep or user action owns recovery).
+  @impl true
+  def handle_info({:rejoin_timer, channel_ref, token}, state) do
+    if Rejoin.valid_fire?(state.rejoin_timers, channel_ref, token) do
+      entry = state.rejoin_timers |> Map.fetch!(channel_ref) |> Rejoin.fired()
+      {:noreply, fire_rejoin(channel_ref, entry, state)}
+    else
+      {:noreply, state}
+    end
+  end
+
+  def handle_info(_msg, state), do: {:noreply, state}
+
   # Private helper functions
 
   defp normalize_topic(topic) do
@@ -315,6 +363,96 @@ defmodule Supabase.Realtime.Channel.Registry do
       topic
     else
       "realtime:#{topic}"
+    end
+  end
+
+  # All rejoin timer Process effects live in these three helpers.
+
+  # Arm a retry for `channel_ref`. The delay is `after_ms.(tries + 1)` where
+  # tries counts FIRED timers, so an arm that replaces a never-fired timer
+  # re-reads the same tries (phoenix Timer semantics).
+  @spec arm_rejoin(state(), String.t()) :: state()
+  defp arm_rejoin(state, channel_ref) do
+    entry = Map.get(state.rejoin_timers, channel_ref)
+
+    if entry && entry.timer, do: Process.cancel_timer(entry.timer)
+
+    token = make_ref()
+    delay = Rejoin.arm_delay(entry, state.rejoin_after_ms)
+    timer = Process.send_after(self(), {:rejoin_timer, channel_ref, token}, delay)
+
+    timers =
+      Map.put(state.rejoin_timers, channel_ref, %{tries: (entry && entry.tries) || 0, token: token, timer: timer})
+
+    %{state | rejoin_timers: timers}
+  end
+
+  # Drop the entry entirely; tries resets with it. Zombies already in the
+  # mailbox are made inert by the token check in handle_info.
+  @spec cancel_rejoin(state(), String.t()) :: state()
+  defp cancel_rejoin(state, channel_ref) do
+    case Map.get(state.rejoin_timers, channel_ref) do
+      %{timer: timer} when timer != nil -> Process.cancel_timer(timer)
+      _ -> :ok
+    end
+
+    %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
+  end
+
+  @spec clear_rejoins(state()) :: state()
+  defp clear_rejoins(state) do
+    for {_ref, %{timer: timer}} <- state.rejoin_timers, timer != nil do
+      Process.cancel_timer(timer)
+    end
+
+    %{state | rejoin_timers: %{}}
+  end
+
+  # The self-scheduled timer is the only Registry code that can run when the
+  # Connection process is already dead (no cast will ever arrive); a call to
+  # a dead registered name would crash the Registry.
+  defp connection_alive?(nil), do: false
+  defp connection_alive?(pid) when is_pid(pid), do: Process.alive?(pid)
+  defp connection_alive?(name), do: !!Process.whereis(name)
+
+  # The stored side was normalized when it was subscribed, the new side just
+  # above in subscribe/4, so both are normalize_filter/2 output.
+  defp duplicate_postgres_binding?(%Channel{} = channel, filter) do
+    channel.bindings
+    |> Map.get("postgres_changes", [])
+    |> Enum.any?(&Channel.same_postgres_filter?(&1.filter, filter))
+  end
+
+  # A valid fire with the channel :errored and the connection up: re-join
+  # (fresh join_ref and token), keeping the fired entry while the outcome is
+  # pending. Everything else drops the entry.
+  @spec fire_rejoin(state(), Rejoin.entry(), String.t()) :: state()
+  defp fire_rejoin(channel_ref, entry, state) do
+    case Store.find_by_ref(state.store, channel_ref) do
+      {:ok, %Channel{state: :errored} = channel} ->
+        if connection_alive?(state.connection) do
+          {:ok, ch} = Store.update_state(state.store, channel, :joining)
+
+          case Connection.join_channel(state.connection, ch) do
+            :ok ->
+              %{state | rejoin_timers: Map.put(state.rejoin_timers, channel_ref, entry)}
+
+            # socket-level recovery owns it: revert and drop
+            {:error, :not_connected} ->
+              Store.update_state(state.store, ch, :errored)
+              %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
+
+            {:error, :channel_not_found} ->
+              %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
+          end
+        else
+          %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
+        end
+
+      # channel gone, not :errored, or connection dead: the :open sweep or
+      # user action owns it
+      _ ->
+        %{state | rejoin_timers: Map.delete(state.rejoin_timers, channel_ref)}
     end
   end
 
@@ -336,27 +474,34 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   defp handle_phx_close(topic, state) do
     # the wire payload is empty (%{}); remove the channel by topic
-    case Store.find_by_topic(state.store, topic) do
-      {:ok, channel} ->
-        Logger.debug("[#{topic}] Channel closed by server")
-        Store.remove(state.store, channel)
+    state =
+      case Store.find_by_topic(state.store, topic) do
+        {:ok, channel} ->
+          Logger.debug("[#{topic}] Channel closed by server")
+          state = cancel_rejoin(state, channel.ref)
+          Store.remove(state.store, channel)
+          state
 
-      {:error, :not_found} ->
-        Logger.debug("[#{topic}] Channel not found for close message")
-    end
+        {:error, :not_found} ->
+          Logger.debug("[#{topic}] Channel not found for close message")
+          state
+      end
 
     {:noreply, state}
   end
 
   defp handle_phx_error(topic, state) do
-    case Store.find_by_topic(state.store, topic) do
-      {:ok, channel} ->
-        Logger.error("[#{topic}] Server sent phx_error, marking channel errored")
-        Store.update_state(state.store, channel, :errored)
+    state =
+      case Store.find_by_topic(state.store, topic) do
+        {:ok, channel} ->
+          Logger.error("[#{topic}] Server sent phx_error, marking channel errored")
+          Store.update_state(state.store, channel, :errored)
+          arm_rejoin(state, channel.ref)
 
-      {:error, :not_found} ->
-        Logger.debug("[#{topic}] Channel not found for error message")
-    end
+        {:error, :not_found} ->
+          Logger.debug("[#{topic}] Channel not found for error message")
+          state
+      end
 
     {:noreply, state}
   end
@@ -365,11 +510,18 @@ defmodule Supabase.Realtime.Channel.Registry do
     status = get_in(msg, ["payload", "status"])
     payload = get_in(msg, ["payload"]) || %{}
 
-    case find_reply_target(state.store, ref) do
-      {:join, channel} -> handle_join_reply(channel, status, payload, state)
-      {:leave, channel} -> handle_leave_reply(channel, status, state)
-      :ignore -> Logger.debug("[#{__MODULE__}]: Ignoring phx_reply for unknown ref: #{inspect(ref)}")
-    end
+    state =
+      case find_reply_target(state.store, ref) do
+        {:join, channel} ->
+          handle_join_reply(channel, status, payload, state)
+
+        {:leave, channel} ->
+          handle_leave_reply(channel, status, state)
+
+        :ignore ->
+          Logger.debug("[#{__MODULE__}]: Ignoring phx_reply for unknown ref: #{inspect(ref)}")
+          state
+      end
 
     {:noreply, state}
   end
@@ -389,36 +541,46 @@ defmodule Supabase.Realtime.Channel.Registry do
 
   defp handle_join_reply(channel, "ok", payload, state) do
     Logger.debug("[#{channel.topic}] Successfully joined #{channel.ref}")
+    # phoenix joinPush ok resets the rejoin timer
+    state = cancel_rejoin(state, channel.ref)
     {:ok, joined} = Store.update_state(state.store, channel, :joined)
     maybe_update_binding_ids(joined, payload, state)
 
     if state.connection do
       GenServer.cast(state.connection, {:channel_joined, channel.topic})
     end
+
+    state
   end
 
   defp handle_join_reply(channel, status, payload, state) when status in ~w(error timeout) do
     reason = get_in(payload, ["response", "reason"])
     Logger.error("[#{channel.topic}] Failed to join channel #{channel.ref}: #{status} #{reason}")
     Store.update_state(state.store, channel, :errored)
+    arm_rejoin(state, channel.ref)
   end
 
-  defp handle_join_reply(channel, status, _payload, _state) do
+  defp handle_join_reply(channel, status, _payload, state) do
     Logger.debug("[#{channel.topic}] Ignoring join reply with status #{inspect(status)}")
+    state
   end
 
   defp handle_leave_reply(channel, "ok", state) do
     Logger.debug("[#{channel.topic}] Successfully left #{channel.ref}")
+    state = cancel_rejoin(state, channel.ref)
     Store.remove(state.store, channel)
+    state
   end
 
   defp handle_leave_reply(channel, status, state) when status in ~w(error timeout) do
     Logger.error("[#{channel.topic}] Failed to leave channel #{channel.ref}: #{status}")
     Store.update_state(state.store, channel, :errored)
+    arm_rejoin(state, channel.ref)
   end
 
-  defp handle_leave_reply(channel, status, _state) do
+  defp handle_leave_reply(channel, status, state) do
     Logger.debug("[#{channel.topic}] Ignoring leave reply with status #{inspect(status)}")
+    state
   end
 
   defp handle_postgres_changes(channels, payload, state) do

@@ -299,6 +299,25 @@ defmodule Supabase.Realtime.Channel do
   end
 
   @doc """
+  Whether two normalized `postgres_changes` filters are the same binding on
+  the wire: the server collapses identical filters into a single subscription.
+
+  Port of realtime-js `isSamePostgresFilter`. Both arguments must be
+  `normalize_filter/2` output (a `%Filter{}` struct already built to a
+  string, `select` already validated). `select` compares as
+  `Enum.join(select, ",")` (order-sensitive, JS `join()` parity). Not
+  compared: `id`, `callback`.
+  """
+  @spec same_postgres_filter?(map(), map()) :: boolean()
+  def same_postgres_filter?(filter_a, filter_b) when is_map(filter_a) and is_map(filter_b) do
+    filter_value(filter_a, :event) == filter_value(filter_b, :event) and
+      filter_value(filter_a, :schema) == filter_value(filter_b, :schema) and
+      filter_value(filter_a, :table) == filter_value(filter_b, :table) and
+      filter_value(filter_a, :filter) == filter_value(filter_b, :filter) and
+      select_key(filter_value(filter_a, :select)) == select_key(filter_value(filter_b, :select))
+  end
+
+  @doc """
   Checks if the channel is joined (subscribed).
 
   ## Parameters
@@ -507,6 +526,13 @@ defmodule Supabase.Realtime.Channel do
 
   defp normalize_event_filter(%{event: :all} = filter), do: %{filter | event: "*"}
   defp normalize_event_filter(filter), do: filter
+
+  # atom-or-string key read: stored filters are atom-keyed (Map.new/1) but
+  # callers may pass string-keyed maps through on/3
+  defp filter_value(filter, key), do: Map.get(filter, key) || Map.get(filter, to_string(key))
+
+  defp select_key(nil), do: nil
+  defp select_key(select) when is_list(select), do: Enum.join(select, ",")
 
   defp maybe_merge_broadcast(config, nil), do: config
 

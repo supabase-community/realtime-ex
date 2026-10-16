@@ -37,9 +37,9 @@ defmodule Supabase.Realtime.MessageTest do
 
       [first, second] = Message.subscription_message(channel, nil).payload.config.postgres_changes
 
-      # add_binding prepends, so the last added binding comes first
-      assert first == %{event: "WRITE", schema: "public"}
-      assert second == %{event: "*", schema: "public"}
+      # bindings are stored newest-first; the wire list is emitted oldest-first
+      assert first == %{event: "*", schema: "public"}
+      assert second == %{event: "WRITE", schema: "public"}
     end
 
     test "presence is disabled by default and enabled by presence bindings" do
