@@ -426,7 +426,7 @@ defmodule Supabase.Realtime.Channel.Registry do
   # A valid fire with the channel :errored and the connection up: re-join
   # (fresh join_ref and token), keeping the fired entry while the outcome is
   # pending. Everything else drops the entry.
-  @spec fire_rejoin(state(), Rejoin.entry(), String.t()) :: state()
+  @spec fire_rejoin(String.t(), Rejoin.entry(), state()) :: state()
   defp fire_rejoin(channel_ref, entry, state) do
     case Store.find_by_ref(state.store, channel_ref) do
       {:ok, %Channel{state: :errored} = channel} ->
