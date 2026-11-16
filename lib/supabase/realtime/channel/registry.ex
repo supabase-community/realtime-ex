@@ -245,9 +245,20 @@ defmodule Supabase.Realtime.Channel.Registry do
   end
 
   def handle_call(:remove_all_channels, _from, state) do
-    for channel <- Store.all(state.store), do: unsubscribe(self(), channel)
+    channels = Store.all(state.store)
 
-    {:reply, :ok, state}
+    if channels == [] do
+      {:reply, :ok, state}
+    else
+      {channels, state} =
+        Enum.map_reduce(channels, state, fn channel, state ->
+          state = cancel_rejoin(state, channel.ref)
+          {:ok, channel} = Store.update_state(state.store, channel, :leaving)
+          {channel, state}
+        end)
+
+      {:reply, :ok, state, {:continue, {:leave, channels}}}
+    end
   end
 
   def handle_call(:get_presence_state, _from, state) do
@@ -321,20 +332,14 @@ defmodule Supabase.Realtime.Channel.Registry do
     {:noreply, state}
   end
 
-  def handle_continue({:leave, channel}, state) do
-    result =
-      if state.connection do
-        Connection.leave_channel(state.connection, channel)
-      else
-        {:error, :not_connected}
-      end
+  def handle_continue({:leave, channel}, state) when not is_list(channel) do
+    leave_channel(channel, state)
 
-    case result do
-      # the server lost every channel on disconnect, so the leave is complete
-      # locally; on :ok the stored leave_ref waits for the phx_reply / phx_close
-      {:error, :not_connected} -> Store.remove(state.store, channel)
-      :ok -> :ok
-    end
+    {:noreply, state}
+  end
+
+  def handle_continue({:leave, channels}, state) when is_list(channels) do
+    Enum.each(channels, &leave_channel(&1, state))
 
     {:noreply, state}
   end
@@ -357,6 +362,22 @@ defmodule Supabase.Realtime.Channel.Registry do
   def handle_info(_msg, state), do: {:noreply, state}
 
   # Private helper functions
+
+  defp leave_channel(channel, state) do
+    result =
+      if state.connection do
+        Connection.leave_channel(state.connection, channel)
+      else
+        {:error, :not_connected}
+      end
+
+    case result do
+      # the server lost every channel on disconnect, so the leave is complete
+      # locally; on :ok the stored leave_ref waits for the phx_reply / phx_close
+      {:error, :not_connected} -> Store.remove(state.store, channel)
+      :ok -> :ok
+    end
+  end
 
   defp normalize_topic(topic) do
     if String.starts_with?(topic, "realtime:") do

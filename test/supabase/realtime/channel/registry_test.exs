@@ -146,26 +146,14 @@ defmodule Supabase.Realtime.Channel.RegistryTest do
     end
   end
 
-  describe "channel states" do
-    test "store can mark channels as leaving", %{registry: registry, store: store} do
-      # Instead of testing the actual remove_all_channels/1 function
-      # which makes calls to the GenServer, we'll test the store operations directly
-      {:ok, channel1} = Registry.create_channel(registry, "topic1")
-      {:ok, channel2} = Registry.create_channel(registry, "topic2")
+  describe "remove_all_channels/1" do
+    test "removes all channels without crashing the registry", %{registry: registry} do
+      {:ok, _channel1} = Registry.create_channel(registry, "topic1")
+      {:ok, _channel2} = Registry.create_channel(registry, "topic2")
 
-      # Update channel states directly through the store
-      {:ok, updated1} = Store.update_state(store, channel1, :leaving)
-      {:ok, updated2} = Store.update_state(store, channel2, :leaving)
-
-      assert updated1.state == :leaving
-      assert updated2.state == :leaving
-
-      # Verify channels have the expected state
-      {:ok, stored1} = Store.find_by_ref(store, channel1.ref)
-      {:ok, stored2} = Store.find_by_ref(store, channel2.ref)
-
-      assert stored1.state == :leaving
-      assert stored2.state == :leaving
+      assert :ok = Registry.remove_all_channels(registry)
+      assert Process.alive?(registry)
+      assert Registry.list_channels(registry) == []
     end
   end
 
