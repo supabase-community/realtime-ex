@@ -2,6 +2,18 @@
 
 All notable changes to this project are documented in this file.
 
+## [0.6.1](https://github.com/supabase-community/realtime-ex/compare/v0.6.0...v0.6.1) (2026-11-17)
+
+
+### Bug Fixes
+
+* **realtime:** correct channel removal and token refresh ([#49](https://github.com/supabase-community/realtime-ex/issues/49)) ([8ac71d0](https://github.com/supabase-community/realtime-ex/commit/8ac71d0b03b6f7134820949647ee135eaffbab50))
+
+
+### Miscellaneous Chores
+
+* **nix:** migrate dev shell to beam-overlay ([973f089](https://github.com/supabase-community/realtime-ex/commit/973f089c39493e9b487f1826c0d60123df0d860b))
+
 ## [0.6.0](https://github.com/supabase-community/realtime-ex/compare/v0.5.0...v0.6.0) (2026-10-16)
 
 
