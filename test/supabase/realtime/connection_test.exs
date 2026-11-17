@@ -738,6 +738,48 @@ defmodule Supabase.Realtime.ConnectionTest do
       assert heartbeat["event"] == "heartbeat"
     end
 
+    test "heartbeat refreshes callback tokens for joined channels", ctx do
+      {conn, _stream_ref} =
+        start_open_connection(ctx, [access_token_fn: fn -> {:ok, "new-token"} end], self())
+
+      assert :sys.get_state(conn).status == :open
+      :sys.get_state(ctx.registry)
+
+      assert :ok = Connection.set_auth(conn, "old-token")
+      assert {:ok, _channel} = Store.update_state(ctx.store, ctx.channel, :joined)
+
+      send(conn, :heartbeat)
+
+      assert_receive {:ws_frame, {:text, token_json}}, 1000
+      token_message = JSON.decode!(token_json)
+      assert token_message["topic"] == "realtime:test_topic"
+      assert token_message["event"] == "access_token"
+      assert token_message["payload"]["access_token"] == "new-token"
+
+      assert_receive {:ws_frame, {:text, heartbeat_json}}, 1000
+      heartbeat = JSON.decode!(heartbeat_json)
+      assert heartbeat["topic"] == "phoenix"
+      assert heartbeat["event"] == "heartbeat"
+      assert :sys.get_state(conn).access_token == "new-token"
+    end
+
+    test "heartbeat does not push the static client token without a callback", ctx do
+      {conn, _stream_ref} = start_open_connection(ctx, [], self())
+
+      assert :sys.get_state(conn).status == :open
+      :sys.get_state(ctx.registry)
+      assert {:ok, _channel} = Store.update_state(ctx.store, ctx.channel, :joined)
+
+      send(conn, :heartbeat)
+
+      assert_receive {:ws_frame, {:text, heartbeat_json}}, 1000
+      heartbeat = JSON.decode!(heartbeat_json)
+      assert heartbeat["topic"] == "phoenix"
+      assert heartbeat["event"] == "heartbeat"
+      assert :sys.get_state(conn).access_token == nil
+      refute_received {:ws_frame, _frame}
+    end
+
     test "inbound binary frames decode through V2 and reach the Registry", ctx do
       on_exit(fn -> RealtimeTest.clear_collector() end)
 

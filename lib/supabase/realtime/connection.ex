@@ -394,10 +394,7 @@ defmodule Supabase.Realtime.Connection do
     state = %{state | access_token: token}
 
     if state.status == :open do
-      for channel <- Store.all(state.store), Channel.joined?(channel) do
-        message = Message.access_token_message(channel, token)
-        send_message_to_topic(channel, message, state)
-      end
+      push_access_token(state, token)
     end
 
     {:reply, :ok, state}
@@ -467,6 +464,7 @@ defmodule Supabase.Realtime.Connection do
       Logger.warning("[#{__MODULE__}]: Heartbeat not acknowledged, forcing reconnect")
       {:noreply, connection_down(state)}
     else
+      state = refresh_access_token(state)
       heartbeat_ref = generate_message_ref()
 
       message = Map.put(Message.heartbeat_message(), :ref, heartbeat_ref)
@@ -692,6 +690,13 @@ defmodule Supabase.Realtime.Connection do
     end
   end
 
+  defp push_access_token(state, token) do
+    for channel <- Store.all(state.store), Channel.joined?(channel) do
+      message = Message.access_token_message(channel, token)
+      send_message_to_topic(channel, message, state)
+    end
+  end
+
   # Token resolution
 
   # order: access_token_fn (0-arity fun or MFA) -> persisted set_auth token ->
@@ -708,6 +713,20 @@ defmodule Supabase.Realtime.Connection do
   defp fetch_token_from_fn(nil), do: :no_fn
   defp fetch_token_from_fn(fun) when is_function(fun, 0), do: fun.()
   defp fetch_token_from_fn({mod, fun, args}), do: apply(mod, fun, args)
+
+  defp refresh_access_token(%{access_token_fn: nil} = state), do: state
+
+  defp refresh_access_token(state) do
+    case fetch_token_from_fn(state.access_token_fn) do
+      {:ok, token} when is_binary(token) and token != state.access_token ->
+        state = %{state | access_token: token}
+        push_access_token(state, token)
+        state
+
+      _ ->
+        state
+    end
+  end
 
   # HTTP fallback
 
